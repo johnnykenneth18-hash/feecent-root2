@@ -17613,6 +17613,47 @@ app.post(
   externalTransferService.handleCreateTransfer,
 );
 
+// Read-only status check for a single transfer, keyed by the
+// transaction_reference returned from POST /api/flutterwave/transfer.
+// Added so the frontend can poll a transfer from "pending" to its
+// final state (completed/failed/reversed/cancelled) instead of the
+// result screen freezing on "Pending" forever — this is purely a
+// SELECT against flutterwave_transfers, it doesn't touch anything
+// external-transfer-service.js writes.
+app.get(
+  "/api/flutterwave/transfer-status/:reference",
+  authenticate,
+  async (req, res) => {
+    try {
+      const { reference } = req.params;
+
+      const { data: transfer, error } = await supabase
+        .from("flutterwave_transfers")
+        .select(
+          "transaction_reference, status, failure_reason, amount, fee_amount",
+        )
+        .eq("transaction_reference", reference)
+        .eq("user_id", req.user.id)
+        .single();
+
+      if (error || !transfer) {
+        return res.status(404).json({ error: "Transfer not found" });
+      }
+
+      res.json({
+        success: true,
+        status: transfer.status,
+        failure_reason: transfer.failure_reason || null,
+        amount: transfer.amount,
+        fee: transfer.fee_amount,
+      });
+    } catch (error) {
+      console.error("Transfer status check error:", error);
+      res.status(500).json({ error: "Failed to check transfer status" });
+    }
+  },
+);
+
 // Cron sweep safety net — add this path to Vercel's crons in vercel.json
 // alongside the existing virtual-account-worker and deposit-webhook-service
 // cron entries.
@@ -18884,6 +18925,171 @@ app.get("/api/sys/accounts", authenticate, authorizeAdmin, async (req, res) => {
     res.status(500).json({ error: "Failed to load accounts" });
   }
 });
+
+// ==================== VIRTUAL ACCOUNT STATUS (ADMIN) ====================
+// Lists users whose Flutterwave dedicated virtual account never made it
+// to ACTIVE (still PENDING/PROCESSING or hit FAILED), with the reason
+// Flutterwave/the worker recorded, and lets an admin retry creation.
+// Visibility of the nav item / retry button is additionally gated by
+// admin_permissions on the frontend (see admin-permissions.js:
+// NAV_REGISTRY "virtual-account-status" and its ACTIONS_REGISTRY entry).
+
+app.get(
+  "/api/sys/virtual-accounts",
+  authenticate,
+  authorizeAdmin,
+  async (req, res) => {
+    try {
+      const { page = 1, limit = 20, status = "all" } = req.query;
+      const offset = (parseInt(page) - 1) * parseInt(limit);
+
+      let countQuery = supabase
+        .from("accounts")
+        .select("*", { count: "exact", head: true })
+        .neq("creation_status", "ACTIVE");
+      let dataQuery = supabase
+        .from("accounts")
+        .select(
+          `
+          id,
+          account_number,
+          provider,
+          provider_account_id,
+          creation_status,
+          failure_reason,
+          retry_count,
+          last_retry_at,
+          created_at,
+          user_id,
+          users!accounts_user_id_fkey (id, email, first_name, last_name, phone, bvn)
+        `,
+        )
+        .neq("creation_status", "ACTIVE");
+
+      if (status !== "all") {
+        countQuery = countQuery.eq("creation_status", status.toUpperCase());
+        dataQuery = dataQuery.eq("creation_status", status.toUpperCase());
+      }
+
+      const [countResult, dataResult] = await Promise.all([
+        countQuery,
+        dataQuery
+          .order("created_at", { ascending: false })
+          .range(offset, offset + parseInt(limit) - 1),
+      ]);
+
+      if (dataResult.error) throw dataResult.error;
+
+      res.json({
+        accounts: dataResult.data || [],
+        pagination: {
+          page: parseInt(page),
+          limit: parseInt(limit),
+          total: countResult.count || 0,
+          pages: Math.ceil((countResult.count || 0) / parseInt(limit)),
+        },
+      });
+    } catch (error) {
+      console.error("Admin virtual-accounts fetch error:", error);
+      res.status(500).json({ error: "Failed to fetch virtual accounts" });
+    }
+  },
+);
+
+app.post(
+  "/api/sys/virtual-accounts/:accountId/retry",
+  authenticate,
+  authorizeAdmin,
+  async (req, res) => {
+    try {
+      const { accountId } = req.params;
+
+      const { data: account, error: accountErr } = await supabase
+        .from("accounts")
+        .select(
+          "id, user_id, creation_status, users!accounts_user_id_fkey (id, email, first_name, last_name, phone, bvn)",
+        )
+        .eq("id", accountId)
+        .single();
+
+      if (accountErr || !account) {
+        return res.status(404).json({ error: "Account not found" });
+      }
+
+      if (account.creation_status === "ACTIVE") {
+        return res
+          .status(400)
+          .json({ error: "This account's virtual account is already active" });
+      }
+
+      const user = account.users;
+      if (!user?.bvn) {
+        return res.status(400).json({
+          error:
+            "This user has no BVN on file — Flutterwave requires one before a permanent virtual account can be created. Ask the user to submit their BVN, then retry.",
+        });
+      }
+
+      // Reset the account back to PENDING and clear the previous failure
+      // so the worker treats this as a fresh attempt.
+      await supabase
+        .from("accounts")
+        .update({
+          creation_status: "PENDING",
+          failure_reason: null,
+          updated_at: new Date().toISOString(),
+        })
+        .eq("id", accountId);
+
+      // Enqueue the same job_type/payload shape used at registration —
+      // see the "ENQUEUE VIRTUAL ACCOUNT CREATION JOB" block above.
+      const { data: job, error: jobError } = await supabase
+        .from("background_jobs")
+        .insert({
+          job_type: "create_virtual_account",
+          payload: {
+            user_id: user.id,
+            account_id: account.id,
+            email: user.email,
+            bvn: user.bvn,
+            first_name: user.first_name,
+            last_name: user.last_name,
+            phone: user.phone,
+          },
+          status: "pending",
+          priority: 50, // above the default 100 — an admin-triggered retry jumps the queue
+        })
+        .select()
+        .single();
+
+      if (jobError || !job) {
+        console.error("Failed to enqueue VA retry job:", jobError);
+        return res.status(500).json({ error: "Failed to enqueue retry job" });
+      }
+
+      // Process it immediately for fast admin feedback — the cron sweep
+      // in virtual-account-worker.js still covers it if this attempt
+      // itself gets interrupted.
+      try {
+        const { waitUntil } = require("@vercel/functions");
+        waitUntil(virtualAccountWorker.processOne(job.id));
+      } catch (waitUntilErr) {
+        virtualAccountWorker
+          .processOne(job.id)
+          .catch((e) => console.error("VA retry processOne failed:", e));
+      }
+
+      res.json({
+        success: true,
+        message: "Retry queued — this usually resolves within a few seconds.",
+        job_id: job.id,
+      });
+    } catch (error) {
+      console.error("Admin virtual-account retry error:", error);
+      res.status(500).json({ error: "Failed to retry virtual account creation" });
+    }
+  },
+);
 
 // Create user (admin)
 app.post("/api/sys/users", authenticate, authorizeAdmin, async (req, res) => {
@@ -21173,4 +21379,3 @@ createDefaultAdmin();
 
 // Add this instead (required for Vercel)
 module.exports = app;
- 
