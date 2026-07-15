@@ -17,6 +17,55 @@ const transporter = nodemailer.createTransport({
   },
 });
 
+// ==================== LEDGER ====================
+// Every balance-affecting movement needs a row in `ledger` (the table
+// admin-ledger reconciliation and derive_ledger_balance() read from) in
+// addition to the transactions_new business-event row. Deposits already
+// did this via process_deposit(); savings deductions/withdrawals never
+// did, which is why reconciliation flagged accounts as out of balance
+// after any savings activity. Mirrors the single-entry-per-user
+// convention process_deposit() uses (one row per user per movement,
+// not full double-entry against a pool account).
+async function recordLedgerEntry({
+  transactionReference,
+  userId,
+  accountId,
+  entryType, // 'DEBIT' | 'CREDIT'
+  amount,
+  balanceBefore,
+  balanceAfter,
+  description,
+  currency = "NGN",
+}) {
+  if (!transactionReference) {
+    console.error(
+      "Ledger entry skipped: no transaction_reference (savings transactions_new insert failed or didn't return one)",
+    );
+    return false;
+  }
+
+  const { error } = await supabase.from("ledger").insert({
+    transaction_reference: transactionReference,
+    user_id: userId,
+    account_id: accountId,
+    currency,
+    entry_type: entryType,
+    amount,
+    balance_before: balanceBefore,
+    balance_after: balanceAfter,
+    running_balance: balanceAfter,
+    description,
+    status: "completed",
+    created_by: userId,
+  });
+
+  if (error) {
+    console.error("Ledger entry error:", error);
+    return false;
+  }
+  return true;
+}
+
 // ==================== SAVINGS POOL ACCOUNTS ====================
 // These are the bank's internal accounts tracking where savings money goes
 
@@ -217,18 +266,35 @@ async function processSingleHarvestDeduction(enrollment) {
     }
 
     // Create transaction record
-    const { error: txError } = await supabase.from("transactions_new").insert({
-      sender_account_id: account.id,
-      sender_user_id: enrollment.user_id,
-      amount: enrollment.daily_amount,
-      description: `Harvest Plan: ${enrollment.harvest_plans?.name || "Harvest Plan"} - Day ${newDaysCompleted}`,
-      transaction_type: "savings",
-      status: "completed",
-      completed_at: new Date().toISOString(),
-      metadata: { is_admin_adjusted: false },
-    });
+    const { data: txRecord, error: txError } = await supabase
+      .from("transactions_new")
+      .insert({
+        sender_account_id: account.id,
+        sender_user_id: enrollment.user_id,
+        amount: enrollment.daily_amount,
+        description: `Harvest Plan: ${enrollment.harvest_plans?.name || "Harvest Plan"} - Day ${newDaysCompleted}`,
+        transaction_type: "savings",
+        status: "completed",
+        completed_at: new Date().toISOString(),
+        metadata: { is_admin_adjusted: false },
+      })
+      .select("transaction_reference")
+      .single();
 
-    if (txError) console.error("Transaction creation error:", txError);
+    if (txError) {
+      console.error("Transaction creation error:", txError);
+    } else {
+      await recordLedgerEntry({
+        transactionReference: txRecord.transaction_reference,
+        userId: enrollment.user_id,
+        accountId: account.id,
+        entryType: "DEBIT",
+        amount: enrollment.daily_amount,
+        balanceBefore: account.balance,
+        balanceAfter: newBalance,
+        description: `Harvest Plan: ${enrollment.harvest_plans?.name || "Harvest Plan"} - Day ${newDaysCompleted}`,
+      });
+    }
 
     // Create savings transaction with pool tracking
     const { error: savingsTxError } = await supabase
@@ -378,17 +444,35 @@ async function processSingleFixedDeduction(saving) {
     }
 
     // Create transaction record
-    const { error: txError } = await supabase.from("transactions_new").insert({
-      sender_account_id: account.id,
-      sender_user_id: saving.user_id,
-      amount: dailyAmount,
-      description: `Fixed Savings Deposit - Day ${Math.ceil(newCurrentSaved / dailyAmount)} of 30`,
-      transaction_type: "savings",
-      status: "completed",
-      completed_at: new Date().toISOString(),
-    });
+    const fixedDescription = `Fixed Savings Deposit - Day ${Math.ceil(newCurrentSaved / dailyAmount)} of 30`;
+    const { data: txRecord, error: txError } = await supabase
+      .from("transactions_new")
+      .insert({
+        sender_account_id: account.id,
+        sender_user_id: saving.user_id,
+        amount: dailyAmount,
+        description: fixedDescription,
+        transaction_type: "savings",
+        status: "completed",
+        completed_at: new Date().toISOString(),
+      })
+      .select("transaction_reference")
+      .single();
 
-    if (txError) console.error("Transaction creation error:", txError);
+    if (txError) {
+      console.error("Transaction creation error:", txError);
+    } else {
+      await recordLedgerEntry({
+        transactionReference: txRecord.transaction_reference,
+        userId: saving.user_id,
+        accountId: account.id,
+        entryType: "DEBIT",
+        amount: dailyAmount,
+        balanceBefore: account.balance,
+        balanceAfter: newBalance,
+        description: fixedDescription,
+      });
+    }
 
     // Create savings transaction with pool tracking
     const { error: savingsTxError } = await supabase
@@ -534,17 +618,35 @@ async function processSingleSaveboxDeduction(saving) {
     }
 
     // Create transaction
-    const { error: txError } = await supabase.from("transactions_new").insert({
-      sender_account_id: account.id,
-      sender_user_id: saving.user_id,
-      amount: dailyAmount,
-      description: `SaveBox Savings - Target: ₦${saving.amount?.toFixed(2) || "0.00"}`,
-      transaction_type: "savings",
-      status: "completed",
-      completed_at: new Date().toISOString(),
-    });
+    const saveboxDescription = `SaveBox Savings - Target: ₦${saving.amount?.toFixed(2) || "0.00"}`;
+    const { data: txRecord, error: txError } = await supabase
+      .from("transactions_new")
+      .insert({
+        sender_account_id: account.id,
+        sender_user_id: saving.user_id,
+        amount: dailyAmount,
+        description: saveboxDescription,
+        transaction_type: "savings",
+        status: "completed",
+        completed_at: new Date().toISOString(),
+      })
+      .select("transaction_reference")
+      .single();
 
-    if (txError) console.error("Transaction creation error:", txError);
+    if (txError) {
+      console.error("Transaction creation error:", txError);
+    } else {
+      await recordLedgerEntry({
+        transactionReference: txRecord.transaction_reference,
+        userId: saving.user_id,
+        accountId: account.id,
+        entryType: "DEBIT",
+        amount: dailyAmount,
+        balanceBefore: account.balance,
+        balanceAfter: newBalance,
+        description: saveboxDescription,
+      });
+    }
 
     // Create savings transaction with pool tracking
     const { error: savingsTxError } = await supabase
@@ -698,17 +800,35 @@ async function processSingleTargetDeduction(saving) {
     }
 
     // Create transaction record
-    const { error: txError } = await supabase.from("transactions_new").insert({
-      sender_account_id: account.id,
-      sender_user_id: saving.user_id,
-      amount: dailyAmount,
-      description: `Target Savings - Daily deposit ₦${dailyAmount}`,
-      transaction_type: "savings",
-      status: "completed",
-      completed_at: new Date().toISOString(),
-    });
+    const targetDescription = `Target Savings - Daily deposit ₦${dailyAmount}`;
+    const { data: txRecord, error: txError } = await supabase
+      .from("transactions_new")
+      .insert({
+        sender_account_id: account.id,
+        sender_user_id: saving.user_id,
+        amount: dailyAmount,
+        description: targetDescription,
+        transaction_type: "savings",
+        status: "completed",
+        completed_at: new Date().toISOString(),
+      })
+      .select("transaction_reference")
+      .single();
 
-    if (txError) console.error("Transaction creation error:", txError);
+    if (txError) {
+      console.error("Transaction creation error:", txError);
+    } else {
+      await recordLedgerEntry({
+        transactionReference: txRecord.transaction_reference,
+        userId: saving.user_id,
+        accountId: account.id,
+        entryType: "DEBIT",
+        amount: dailyAmount,
+        balanceBefore: account.balance,
+        balanceAfter: newBalance,
+        description: targetDescription,
+      });
+    }
 
     // Create savings transaction with pool tracking
     const { error: savingsTxError } = await supabase
@@ -856,19 +976,37 @@ async function processSavingsWithdrawal(
     );
 
     // ========== CREATE TRANSACTION RECORD ==========
-    const { error: txError } = await supabase.from("transactions_new").insert({
-      receiver_account_id: userAccount.id,
-      receiver_user_id: userId,
-      amount: netAmount,
-      metadata: { fee_amount: feeAmount },
-      description: `${savingsType.charAt(0).toUpperCase() + savingsType.slice(1)} Savings Withdrawal${feeAmount > 0 ? ` (Fee: ₦${feeAmount})` : ""}`,
-      transaction_type: "savings_withdrawal",
-      status: "completed",
-      completed_at: new Date().toISOString(),
-      created_at: new Date().toISOString(),
-    });
+    const withdrawalDescription = `${savingsType.charAt(0).toUpperCase() + savingsType.slice(1)} Savings Withdrawal${feeAmount > 0 ? ` (Fee: ₦${feeAmount})` : ""}`;
+    const { data: txRecord, error: txError } = await supabase
+      .from("transactions_new")
+      .insert({
+        receiver_account_id: userAccount.id,
+        receiver_user_id: userId,
+        amount: netAmount,
+        metadata: { fee_amount: feeAmount },
+        description: withdrawalDescription,
+        transaction_type: "savings_withdrawal",
+        status: "completed",
+        completed_at: new Date().toISOString(),
+        created_at: new Date().toISOString(),
+      })
+      .select("transaction_reference")
+      .single();
 
-    if (txError) console.error("Transaction creation error:", txError);
+    if (txError) {
+      console.error("Transaction creation error:", txError);
+    } else {
+      await recordLedgerEntry({
+        transactionReference: txRecord.transaction_reference,
+        userId: userId,
+        accountId: userAccount.id,
+        entryType: "CREDIT",
+        amount: netAmount,
+        balanceBefore: userAccount.balance,
+        balanceAfter: newUserBalance,
+        description: withdrawalDescription,
+      });
+    }
 
     // ========== CREATE SAVINGS TRANSACTION RECORD ==========
     const { error: savingsTxError } = await supabase
@@ -999,6 +1137,36 @@ async function retryFailedDeductions() {
         .from("accounts")
         .update({ balance: newBalance, available_balance: newAvailable })
         .eq("id", account.id);
+
+      const retryDescription = `${item.savings_type.charAt(0).toUpperCase() + item.savings_type.slice(1)} Savings Deposit (retry)`;
+      const { data: txRecord, error: txError } = await supabase
+        .from("transactions_new")
+        .insert({
+          sender_account_id: account.id,
+          sender_user_id: item.user_id,
+          amount: item.amount,
+          description: retryDescription,
+          transaction_type: "savings",
+          status: "completed",
+          completed_at: new Date().toISOString(),
+        })
+        .select("transaction_reference")
+        .single();
+
+      if (txError) {
+        console.error("Retry transaction creation error:", txError);
+      } else {
+        await recordLedgerEntry({
+          transactionReference: txRecord.transaction_reference,
+          userId: item.user_id,
+          accountId: account.id,
+          entryType: "DEBIT",
+          amount: item.amount,
+          balanceBefore: account.balance,
+          balanceAfter: newBalance,
+          description: retryDescription,
+        });
+      }
 
       await supabase
         .from("savings_deduction_queue")
