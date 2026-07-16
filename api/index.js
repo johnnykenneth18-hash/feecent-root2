@@ -268,6 +268,9 @@ app.post(
   depositWebhookService.handleFlutterwaveWebhook,
 );
 
+const billsCatalogRouter = require("../lib/bills-catalog-routes");
+const billsAdminRouter = require("../lib/bills-admin-routes");
+
 // Cron sweep: retries any deposit webhooks that failed verification or
 // crediting on their first attempt.
 app.get("/api/cron/deposit-webhooks", depositWebhookService.cronHandler);
@@ -8117,7 +8120,7 @@ app.get("/api/user/beneficiaries/recent", authenticate, async (req, res) => {
 
 // =========================Bills Sections =========================
 // Get bills
-app.get(
+/*app.get(
   "/api/user/bills",
   authenticate,
   checkAccountFrozen,
@@ -8178,7 +8181,7 @@ app.post(
       res.status(500).json({ error: "Failed to add bill" });
     }
   },
-);
+);*/
 
 // Pay bill
 /*app.post(
@@ -8283,6 +8286,10 @@ app.post(
 
 const billsService = require("../lib/bills-service");
 const billsWorker = require("../lib/bills-worker");
+
+app.use("/api/bills", authenticate, billsCatalogRouter);
+
+app.use("/api/sys/bills", authenticate, authorizeAdmin, billsAdminRouter);
 
 app.post(
   "/api/user/bills/verify-pin",
