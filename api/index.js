@@ -6179,7 +6179,7 @@ app.delete(
 );
 
 // Enhanced transfer with device trust and recipient checking - WITH EARLY FAILURE RECORDING
-/*app.post(
+app.post(
   "/api/user/transfer",
   authenticate,
   checkAccountFrozen,
@@ -6189,7 +6189,71 @@ app.delete(
   async (req, res) => {
     let failedRecordId = null;
 
+    // (a) added transfer_auth_token
+    const {
+      from_account_id,
+      to_account_number,
+      amount,
+      description,
+      transfer_auth_token,
+    } = req.body;
+    const requestId =
+      req.headers["idempotency-key"] ||
+      req.body.requestId ||
+      crypto.randomUUID();
+
     try {
+      if (!from_account_id || !to_account_number || !amount || amount <= 0) {
+        return res
+          .status(400)
+          .json({ error: "Missing or invalid fields", code: "INVALID_INPUT" });
+      }
+
+      // (b) NEW — enforce that a valid, matching, unused PIN authorization
+      // exists for this exact transfer before touching any balances.
+      if (!transfer_auth_token) {
+        return res.status(401).json({
+          error: "Transfer PIN verification required",
+          code: "PIN_VERIFICATION_REQUIRED",
+        });
+      }
+
+      const contextHash = hashTransferContext(
+        from_account_id,
+        to_account_number,
+        amount,
+      );
+
+      const { data: authRecord, error: authError } = await supabase
+        .from("transfer_authorizations")
+        .select("id, used, expires_at, context_hash, user_id")
+        .eq("token", transfer_auth_token)
+        .single();
+
+      if (
+        authError ||
+        !authRecord ||
+        authRecord.used ||
+        authRecord.user_id !== req.user.id ||
+        authRecord.context_hash !== contextHash ||
+        new Date(authRecord.expires_at) < new Date()
+      ) {
+        return res.status(401).json({
+          error:
+            "Invalid or expired transfer authorization. Please re-enter your PIN.",
+          code: "PIN_VERIFICATION_REQUIRED",
+        });
+      }
+
+      // Mark used immediately (single-use). Doing this before
+      // process_transfer means a token can't be raced across two
+      // concurrent requests even if preventConcurrentTransfer's lock has
+      // any edge-case gap.
+      await supabase
+        .from("transfer_authorizations")
+        .update({ used: true })
+        .eq("id", authRecord.id);
+
       const {
         from_account_id,
         to_account_number,
@@ -6580,7 +6644,10 @@ app.delete(
 
       // If we get here, delete the failed record since transfer will succeed
       if (failedRecordId) {
-        await supabase.from("transactions_new").delete().eq("id", failedRecordId);
+        await supabase
+          .from("transactions_new")
+          .delete()
+          .eq("id", failedRecordId);
         failedRecordId = null;
       }
 
@@ -6902,13 +6969,13 @@ app.delete(
       res.status(500).json({ error: "Transfer failed: " + error.message });
     }
   },
-);*/
+);
 
 // ============================================================
 // NEW TRANSFER ROUTE - Add to index.js
 // ============================================================
 
-const FinancialTransactionService = require("./services/FinancialTransactionService");
+/*const FinancialTransactionService = require("./services/FinancialTransactionService");
 const transactionService = new FinancialTransactionService();
 
 app.post(
@@ -7101,7 +7168,7 @@ app.post(
       });
     }
   },
-);
+);*/
 
 async function createInitialFailedTransactionRecord(
   userId,
@@ -10489,6 +10556,8 @@ app.post(
   },
 );
 
+*/
+
 // index.js - REPLACE the existing savings withdrawal endpoint
 app.post(
   "/api/user/savings/:type/:id/withdraw",
@@ -10732,17 +10801,19 @@ app.post(
       }
 
       // ========== Create transaction record ==========
-      const { error: txError } = await supabase.from("transactions_new").insert({
-        receiver_account_id: account.id,
-        receiver_user_id: req.user.id,
-        amount: withdrawAmount,
-        description: `${type.charAt(0).toUpperCase() + type.slice(1)} Savings Withdrawal${feeAmount > 0 ? ` (Fee: ₦${feeAmount})` : ""}`,
-        transaction_type: "savings_withdrawal",
-        status: "completed",
-        completed_at: new Date().toISOString(),
-        created_at: new Date().toISOString(),
-        metadata: { fee_amount: feeAmount },
-      });
+      const { error: txError } = await supabase
+        .from("transactions_new")
+        .insert({
+          receiver_account_id: account.id,
+          receiver_user_id: req.user.id,
+          amount: withdrawAmount,
+          description: `${type.charAt(0).toUpperCase() + type.slice(1)} Savings Withdrawal${feeAmount > 0 ? ` (Fee: ₦${feeAmount})` : ""}`,
+          transaction_type: "savings_withdrawal",
+          status: "completed",
+          completed_at: new Date().toISOString(),
+          created_at: new Date().toISOString(),
+          metadata: { fee_amount: feeAmount },
+        });
 
       if (txError) console.error("Transaction creation error:", txError);
 
@@ -10782,7 +10853,7 @@ app.post(
         .json({ error: "Failed to process withdrawal: " + error.message });
     }
   },
-);*/
+);
 
 // ============================================================
 // SAVINGS WITHDRAWAL API - PRODUCTION GRADE
@@ -10790,7 +10861,7 @@ app.post(
 // Add this to your index.js file
 // REPLACE the existing /api/user/savings/:type/:id/withdraw endpoint
 
-app.post(
+/*app.post(
   "/api/user/savings/:type/:id/withdraw",
   authenticate,
   checkAccountFrozen,
@@ -11368,7 +11439,7 @@ app.post(
       });
     }
   },
-);
+);*/
 
 // Cancel savings plan (stop auto-save but keep saved amount)
 app.post(
@@ -12872,7 +12943,7 @@ app.post(
 );
 
 // ==================== CREATE ADJUSTMENT ====================
-app.post(
+/*app.post(
   "/api/sys/users/:userId/adjust-balance",
   authenticate,
   authorizeAdmin,
@@ -13013,7 +13084,115 @@ app.post(
       });
     }
   },
+);*/
+
+app.post(
+  "/api/sys/users/:userId/adjust-balance",
+  authenticate,
+  authorizeAdmin,
+  async (req, res) => {
+    const { userId } = req.params;
+    const { amount, direction, reason } = req.body;
+    const requestId = req.headers["idempotency-key"] || crypto.randomUUID();
+
+    try {
+      if (!amount || amount <= 0) {
+        return res.status(400).json({ error: "Invalid amount", code: "INVALID_AMOUNT" });
+      }
+      if (!direction || !["credit", "debit"].includes(direction)) {
+        return res.status(400).json({
+          error: "Invalid direction: must be credit or debit",
+          code: "INVALID_DIRECTION",
+        });
+      }
+      if (!reason || reason.trim().length < 3) {
+        return res.status(400).json({
+          error: "Adjustment reason required (minimum 3 characters)",
+          code: "REASON_REQUIRED",
+        });
+      }
+
+      const { data: account, error: accountError } = await supabase
+        .from("accounts")
+        .select("id, user_id, balance, available_balance")
+        .eq("user_id", userId)
+        .eq("account_type", "checking")
+        .single();
+
+      if (accountError || !account) {
+        return res.status(404).json({ error: "User account not found", code: "ACCOUNT_NOT_FOUND" });
+      }
+
+      const { data: adjAccountSetting } = await supabase
+        .from("system_account_ids")
+        .select("account_id")
+        .eq("key", "ADMIN_ADJUSTMENT_ACCOUNT")
+        .single();
+
+      if (!adjAccountSetting || !adjAccountSetting.account_id) {
+        return res.status(500).json({
+          error: "Adjustment account not configured",
+          code: "SYSTEM_CONFIG_ERROR",
+        });
+      }
+
+      const { data: result, error: rpcError } = await supabase.rpc(
+        "process_admin_balance_adjustment",
+        {
+          p_request_id: requestId,
+          p_admin_id: req.user.id,
+          p_target_user_id: userId,
+          p_user_account_id: account.id,
+          p_adjustment_account_id: adjAccountSetting.account_id,
+          p_amount: amount,
+          p_direction: direction,
+          p_reason: reason,
+        },
+      );
+
+      if (rpcError) {
+        console.error("Adjustment RPC error:", rpcError);
+
+        if (rpcError.message?.includes("Insufficient balance")) {
+          return res.status(400).json({
+            error: "User does not have sufficient balance for this debit",
+            code: "INSUFFICIENT_BALANCE",
+          });
+        }
+
+        return res.status(500).json({
+          error: "Adjustment failed",
+          code: "ADJUSTMENT_FAILED",
+          message: rpcError.message,
+        });
+      }
+
+      if (result.duplicate) {
+        return res.json({
+          success: true,
+          message: "Adjustment already processed (duplicate request)",
+          transaction_reference: result.transaction_reference,
+        });
+      }
+
+      res.json({
+        success: true,
+        message: `Balance ${direction}ed successfully`,
+        transaction_reference: result.transaction_reference,
+        new_balance: result.new_balance,
+      });
+    } catch (error) {
+      console.error("Adjustment error:", error);
+      res.status(500).json({
+        error: "Adjustment failed",
+        code: "ADJUSTMENT_FAILED",
+        message: error.message,
+      });
+    }
+  },
 );
+
+
 
 // ==================== EXPORT GENERAL LEDGER ====================
 app.get(
@@ -15395,7 +15574,7 @@ app.post("/api/user/set-transfer-pin", authenticate, async (req, res) => {
 });
 
 // Verify transfer PIN
-app.post("/api/user/verify-transfer-pin", authenticate, async (req, res) => {
+/*app.post("/api/user/verify-transfer-pin", authenticate, async (req, res) => {
   try {
     const { pin } = req.body;
 
@@ -15460,6 +15639,100 @@ app.post("/api/user/verify-transfer-pin", authenticate, async (req, res) => {
         frozen: newAttempts >= 4,
       });
     }
+  } catch (error) {
+    console.error("Verify PIN error:", error);
+    res.status(500).json({ error: "PIN verification failed" });
+  }
+});*/
+
+app.post("/api/user/verify-transfer-pin", authenticate, async (req, res) => {
+  try {
+    const { pin, from_account_id, to_account_number, amount } = req.body;
+
+    if (!pin || pin.length !== 4) {
+      return res
+        .status(400)
+        .json({ valid: false, error: "Invalid PIN format" });
+    }
+    if (!from_account_id || !to_account_number || !amount) {
+      return res.status(400).json({
+        valid: false,
+        error: "from_account_id, to_account_number, and amount are required",
+      });
+    }
+
+    const { data: user, error } = await supabase
+      .from("users")
+      .select("transfer_pin, pin_attempts, last_pin_attempt")
+      .eq("id", req.user.id)
+      .single();
+
+    if (error) throw error;
+
+    if (!user.transfer_pin) {
+      return res.json({ valid: false, needs_setup: true });
+    }
+
+    if (user.pin_attempts >= 4) {
+      return res.status(403).json({
+        valid: false,
+        frozen: true,
+        error: "Too many incorrect PIN attempts. Account frozen.",
+      });
+    }
+
+    const isValid = await bcrypt.compare(pin, user.transfer_pin);
+
+    if (!isValid) {
+      const newAttempts = (user.pin_attempts || 0) + 1;
+      const updates = {
+        pin_attempts: newAttempts,
+        last_pin_attempt: new Date(),
+      };
+
+      if (newAttempts >= 4) {
+        updates.is_frozen = true;
+        updates.freeze_reason =
+          "Too many incorrect PIN attempts - Contact support to unfreeze";
+        updates.unfreeze_method = "support";
+      }
+
+      await supabase.from("users").update(updates).eq("id", req.user.id);
+
+      return res.json({
+        valid: false,
+        attempts_remaining: 4 - newAttempts,
+        frozen: newAttempts >= 4,
+      });
+    }
+
+    // Correct PIN — reset attempts and mint a token bound to THIS exact
+    // transfer (same amount, same accounts). Expires in 2 minutes so a
+    // leaked token has a tiny window and can't sit around indefinitely.
+    await supabase
+      .from("users")
+      .update({ pin_attempts: 0, last_pin_attempt: null })
+      .eq("id", req.user.id);
+
+    const token = crypto.randomBytes(32).toString("hex");
+    const contextHash = hashTransferContext(
+      from_account_id,
+      to_account_number,
+      amount,
+    );
+
+    const { error: insertError } = await supabase
+      .from("transfer_authorizations")
+      .insert({
+        user_id: req.user.id,
+        token,
+        context_hash: contextHash,
+        expires_at: new Date(Date.now() + 2 * 60 * 1000).toISOString(),
+      });
+
+    if (insertError) throw insertError;
+
+    res.json({ valid: true, transfer_auth_token: token, expires_in: 120 });
   } catch (error) {
     console.error("Verify PIN error:", error);
     res.status(500).json({ error: "PIN verification failed" });
