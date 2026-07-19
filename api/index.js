@@ -271,6 +271,8 @@ app.post(
 const billsCatalogRouter = require("../lib/bills-catalog-routes");
 const billsAdminRouter = require("../lib/bills-admin-routes");
 
+const { sendToToken, sendToTokens } = require("../lib/fcm-service");
+
 // Cron sweep: retries any deposit webhooks that failed verification or
 // crediting on their first attempt.
 app.get("/api/cron/deposit-webhooks", depositWebhookService.cronHandler);
@@ -651,13 +653,11 @@ async function sendPushNotificationToUser(userId, title, body, data = {}) {
     }
 
     let sent = false;
-    for (const token of tokens) {
-      if (token.platform === "android" || token.platform === "ios") {
-        // For native Android/iOS, you would send via FCM
-        // This requires setting up a FCM server key
-        // For now, store in notifications table
-        sent = true;
-      } else {
+        for (const token of tokens) {
+          if (token.platform === "android" || token.platform === "ios") {
+            const result = await sendToToken(token.push_token, { title, body, data });
+            if (result.success) sent = true;
+          } else {
         // Web push
         const { webpush } = require("web-push");
         try {
@@ -774,7 +774,7 @@ async function sendPushNotificationForInAppNotification(
     let sent = false;
 
     // Send to all active tokens
-    for (const token of tokens) {
+    /*for (const token of tokens) {
       try {
         if (token.platform === "android") {
           // For Capacitor Android, we need to send via FCM
@@ -784,6 +784,45 @@ async function sendPushNotificationForInAppNotification(
             "Android push token found, notification will be delivered by Capacitor",
           );
           sent = true;
+        } else if (token.platform === "web") {
+          // For web PWA
+          try {
+            const webpush = require("web-push");
+            await webpush.sendNotification(
+              JSON.parse(token.push_token),
+              JSON.stringify(payload),
+            );
+            sent = true;
+          } catch (err) {
+            console.error("Web push error:", err);
+          }
+        } else {
+          sent = true;
+        }
+      } catch (err) {
+        console.error(`Push send error for token ${token.id}:`, err);
+      }
+    }*/
+
+    // Send to all active tokens
+    for (const token of tokens) {
+      try {
+        if (token.platform === "android" || token.platform === "ios") {
+          const result = await sendToToken(token.push_token, {
+            title: payload.title,
+            body: payload.body,
+            data: payload.data,
+          });
+          if (result.success) {
+            sent = true;
+          } else if (result.invalidToken) {
+            // Dead token — deactivate it so future sends don't waste
+            // time retrying something FCM has already told us is gone.
+            await supabase
+              .from("user_push_tokens")
+              .update({ is_active: false })
+              .eq("push_token", token.push_token);
+          }
         } else if (token.platform === "web") {
           // For web PWA
           try {
@@ -6651,11 +6690,14 @@ app.post(
         failedRecordId = null;
       }
 
-      // Calculate fee
+      // Internal transfers made from the dedicated Internal Transfer
+      // button are free, full stop — no ₦50-over-₦10k fee, no tier
+      // lookup. This is the ONLY free path in the app. Transfers that
+      // land on a Feecent user via the external TRANSFER button still
+      // go through reserve_internal_transfer_as_external() in
+      // external-transfer-service.js and are charged the normal
+      // external fee schedule — see the NOTE in that file.
       let feeAmount = 0;
-      if (amount >= 10000) {
-        feeAmount = 50;
-      }
 
       const totalDeduction = amount + feeAmount;
 
@@ -17837,6 +17879,21 @@ app.post(
       if (response.data.status === "success") {
         const accountData = response.data.data;
 
+        // A "success" envelope with an empty/blank account_name is how
+        // Flutterwave represents "this account number has no KYC'd
+        // owner at this bank" for some partner banks, instead of an
+        // error status. Left unguarded, that produced a blank name in
+        // the confirmation modal that looked like a frontend bug
+        // rather than a bad input. Treat it as the not-found case it is.
+        if (!accountData.account_name || !accountData.account_name.trim()) {
+          return res.status(404).json({
+            error: "User does not exist",
+            code: "NO_KYC_FOR_ACCOUNT",
+            message:
+              "No KYC on file for this account number at the selected bank. Please check the account number and bank, and try again.",
+          });
+        }
+
         res.json({
           success: true,
           account_name: accountData.account_name,
@@ -17852,7 +17909,7 @@ app.post(
 
       // Handle specific Flutterwave errors
       if (error.response?.data?.status === "error") {
-        const message = error.response.data.message;
+        const message = error.response.data.message || "";
         if (message.includes("Invalid account number")) {
           return res.status(400).json({
             error: "Invalid account number",
@@ -17867,15 +17924,21 @@ app.post(
             message: "Please select a valid bank",
           });
         }
-        if (message.includes("Account not found")) {
+        if (
+          message.includes("Account not found") ||
+          message.toLowerCase().includes("no record") ||
+          message.toLowerCase().includes("does not exist")
+        ) {
           return res.status(404).json({
-            error: "Account not found",
+            error: "User does not exist",
             code: "ACCOUNT_NOT_FOUND",
             message: "No account found with these details",
           });
         }
       }
 
+      // Anything else (timeout, unexpected shape, etc.) — still a clear,
+      // named error rather than a blank field for the user to puzzle over.
       res.status(500).json({
         error: "Verification failed",
         code: "VERIFICATION_FAILED",
@@ -20011,6 +20074,162 @@ app.post(
   },
 );
 
+// ============================================================
+// FEE MANAGEMENT — admin-editable transfer_fee_tiers
+// Backs the Fee Management screen (admin-fee-management.js) and is
+// the single source of truth calculate_external_transfer_fee() reads
+// in external-transfer-service.js. Internal transfers made via the
+// dedicated Internal Transfer button are NOT priced from this table —
+// they stay free, per spec, regardless of what's configured here.
+// ============================================================
+app.get(
+  "/api/sys/fee-tiers",
+  authenticate,
+  authorizeAdmin,
+  async (req, res) => {
+    try {
+      const { data, error } = await supabase
+        .from("transfer_fee_tiers")
+        .select("*")
+        .order("sort_order", { ascending: true });
+      if (error) throw error;
+      res.json({ success: true, tiers: data || [] });
+    } catch (error) {
+      console.error("Fetch fee tiers error:", error);
+      res.status(500).json({ error: "Failed to fetch fee tiers" });
+    }
+  },
+);
+
+app.post(
+  "/api/sys/fee-tiers",
+  authenticate,
+  authorizeAdmin,
+  async (req, res) => {
+    try {
+      const {
+        min_amount,
+        max_amount,
+        flat_fee,
+        percentage_fee,
+        fee_cap,
+        label,
+        sort_order,
+      } = req.body;
+
+      if (min_amount === undefined || flat_fee === undefined) {
+        return res
+          .status(400)
+          .json({ error: "min_amount and flat_fee are required" });
+      }
+
+      const { data, error } = await supabase
+        .from("transfer_fee_tiers")
+        .insert({
+          min_amount,
+          max_amount: max_amount ?? null,
+          flat_fee,
+          percentage_fee: percentage_fee || 0,
+          fee_cap: fee_cap ?? null,
+          label: label || null,
+          sort_order: sort_order ?? 0,
+          updated_by: req.user.id,
+        })
+        .select()
+        .single();
+      if (error) throw error;
+
+      await supabase.from("admin_actions").insert({
+        admin_id: req.user.id,
+        action_type: "create_fee_tier",
+        details: data,
+      });
+
+      res.json({ success: true, tier: data });
+    } catch (error) {
+      console.error("Create fee tier error:", error);
+      res.status(500).json({ error: "Failed to create fee tier" });
+    }
+  },
+);
+
+app.put(
+  "/api/sys/fee-tiers/:id",
+  authenticate,
+  authorizeAdmin,
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+      const {
+        min_amount,
+        max_amount,
+        flat_fee,
+        percentage_fee,
+        fee_cap,
+        label,
+        sort_order,
+        is_active,
+      } = req.body;
+
+      const updates = { updated_by: req.user.id, updated_at: new Date() };
+      if (min_amount !== undefined) updates.min_amount = min_amount;
+      if (max_amount !== undefined) updates.max_amount = max_amount;
+      if (flat_fee !== undefined) updates.flat_fee = flat_fee;
+      if (percentage_fee !== undefined) updates.percentage_fee = percentage_fee;
+      if (fee_cap !== undefined) updates.fee_cap = fee_cap;
+      if (label !== undefined) updates.label = label;
+      if (sort_order !== undefined) updates.sort_order = sort_order;
+      if (is_active !== undefined) updates.is_active = is_active;
+
+      const { data, error } = await supabase
+        .from("transfer_fee_tiers")
+        .update(updates)
+        .eq("id", id)
+        .select()
+        .single();
+      if (error) throw error;
+
+      await supabase.from("admin_actions").insert({
+        admin_id: req.user.id,
+        action_type: "update_fee_tier",
+        details: { id, updates },
+      });
+
+      res.json({ success: true, tier: data });
+    } catch (error) {
+      console.error("Update fee tier error:", error);
+      res.status(500).json({ error: "Failed to update fee tier" });
+    }
+  },
+);
+
+app.delete(
+  "/api/sys/fee-tiers/:id",
+  authenticate,
+  authorizeAdmin,
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+      const { error } = await supabase
+        .from("transfer_fee_tiers")
+        .update({ is_active: false, updated_by: req.user.id, updated_at: new Date() })
+        .eq("id", id);
+      if (error) throw error;
+
+      await supabase.from("admin_actions").insert({
+        admin_id: req.user.id,
+        action_type: "deactivate_fee_tier",
+        details: { id },
+      });
+
+      res.json({ success: true });
+    } catch (error) {
+      console.error("Deactivate fee tier error:", error);
+      res.status(500).json({ error: "Failed to deactivate fee tier" });
+    }
+  },
+);
+
 // Get admin settings
 app.get("/api/sys/settings", authenticate, authorizeAdmin, async (req, res) => {
   try {
@@ -20928,7 +21147,7 @@ app.post(
 // ADMIN PUSH NOTIFICATIONS API
 // ============================================
 
-const ONESIGNAL_APP_ID = process.env.ONESIGNAL_APP_ID;
+/*const ONESIGNAL_APP_ID = process.env.ONESIGNAL_APP_ID;
 const ONESIGNAL_REST_API_KEY = process.env.ONESIGNAL_REST_API_KEY;
 
 // Helper: Send push via OneSignal
@@ -20993,7 +21212,7 @@ async function sendOneSignalPush(
     console.error("[OneSignal] Send error:", error);
     return { success: false, error: error.message };
   }
-}
+}*/
 
 // Helper: Get push tokens for users
 async function getUserPushTokens(userIds) {
@@ -21001,7 +21220,7 @@ async function getUserPushTokens(userIds) {
     .from("user_push_tokens")
     .select("user_id, push_token")
     .in("user_id", userIds)
-    .eq("platform", "onesignal")
+    .in("platform", ["android", "ios"])
     .eq("is_active", true);
 
   if (error || !tokens) return [];
@@ -21250,11 +21469,16 @@ app.post(
       const playerIds = uniqueTokens.map((t) => t.push_token);
 
       // Send push via OneSignal
-      const pushResult = await sendOneSignalPush(playerIds, title, message, {
-        type: "admin_push",
-        admin_id: req.user.id,
-        timestamp: new Date().toISOString(),
-        ...data,
+      // Send push via FCM
+      const pushResult = await sendToTokens(playerIds, {
+        title,
+        body: message,
+        data: {
+          type: "admin_push",
+          admin_id: req.user.id,
+          timestamp: new Date().toISOString(),
+          ...data,
+        },
       });
 
       // Log the push
