@@ -13097,7 +13097,9 @@ app.post(
 
     try {
       if (!amount || amount <= 0) {
-        return res.status(400).json({ error: "Invalid amount", code: "INVALID_AMOUNT" });
+        return res
+          .status(400)
+          .json({ error: "Invalid amount", code: "INVALID_AMOUNT" });
       }
       if (!direction || !["credit", "debit"].includes(direction)) {
         return res.status(400).json({
@@ -13120,7 +13122,9 @@ app.post(
         .single();
 
       if (accountError || !account) {
-        return res.status(404).json({ error: "User account not found", code: "ACCOUNT_NOT_FOUND" });
+        return res
+          .status(404)
+          .json({ error: "User account not found", code: "ACCOUNT_NOT_FOUND" });
       }
 
       const { data: adjAccountSetting } = await supabase
@@ -13191,8 +13195,6 @@ app.post(
     }
   },
 );
-
-
 
 // ==================== EXPORT GENERAL LEDGER ====================
 app.get(
@@ -19755,7 +19757,7 @@ app.get(
       } = req.query;
       const offset = (page - 1) * limit;
 
-      let query = supabase
+      /*let query = supabase
         .from("transactions_new")
         .select(
           "*, from_account:accounts!transactions_from_account_id_fkey(*), to_account:accounts!transactions_to_account_id_fkey(*)",
@@ -19764,6 +19766,19 @@ app.get(
 
       if (user_id) {
         query = query.or(`from_user_id.eq.${user_id},to_user_id.eq.${user_id}`);
+      }*/
+
+      let query = supabase
+        .from("transactions_new")
+        .select(
+          "*, from_account:accounts!transactions_new_sender_account_id_fkey(*), to_account:accounts!transactions_new_receiver_account_id_fkey(*)",
+          { count: "exact" },
+        );
+
+      if (user_id) {
+        query = query.or(
+          `sender_user_id.eq.${user_id},receiver_user_id.eq.${user_id}`,
+        );
       }
 
       if (type) {
@@ -20535,7 +20550,7 @@ app.get(
     try {
       const { transactionId } = req.params;
 
-      const { data: transaction, error } = await supabase
+      /*const { data: transaction, error } = await supabase
         .from("transactions_new")
         .select(
           `
@@ -20545,6 +20560,20 @@ app.get(
                 from_user:users!transactions_from_user_id_fkey(first_name, last_name, email),
                 to_user:users!transactions_to_user_id_fkey(first_name, last_name, email)
             `,
+        )
+        .eq("id", transactionId)
+        .single();*/
+
+      const { data: transaction, error } = await supabase
+        .from("transactions_new")
+        .select(
+          `
+                        *,
+                        from_account:accounts!transactions_new_sender_account_id_fkey(*),
+                        to_account:accounts!transactions_new_receiver_account_id_fkey(*),
+                        from_user:users!transactions_new_sender_user_id_fkey(first_name, last_name, email),
+                        to_user:users!transactions_new_receiver_user_id_fkey(first_name, last_name, email)
+                    `,
         )
         .eq("id", transactionId)
         .single();
