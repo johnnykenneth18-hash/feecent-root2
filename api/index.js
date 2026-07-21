@@ -13,6 +13,39 @@ const router = express.Router();
 const nodemailer = require("nodemailer");
 const webpush = require("web-push");
 const crypto = require("crypto");
+
+// Several routes (adjust-balance, /user/transfer, ...) feed
+// req.headers["idempotency-key"] straight into a UUID-typed RPC parameter
+// (p_request_id). backend-config.js on the client now always sends a real
+// UUID there, but this stays as a backstop against any caller — an old
+// cached mobile build, a curl test, a future integration — that sends a
+// non-UUID value. Without it, a bad header crashes the RPC with Postgres
+// 22P02 instead of just minting a fresh server-side UUID and moving on.
+const UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+function safeRequestId(headerValue) {
+  return headerValue && UUID_RE.test(headerValue)
+    ? headerValue
+    : crypto.randomUUID();
+}
+
+// Ledger rows include real balance movements (DEBIT/CREDIT, and the
+// WALLET_DEBIT/WALLET_CREDIT variant reserve_internal_transfer_as_external
+// writes) alongside pure audit/memo rows (WALLET_DEBIT_RESERVED,
+// WALLET_DEBIT_RESERVE_RELEASE) whose balance_before === balance_after by
+// design — they document that a reservation happened, they don't move
+// money. Reconciliation code must ignore the memo rows entirely (0, not a
+// debit) or every reserve-then-complete transfer gets debited twice. This
+// mirrors derive_ledger_balance()'s CASE/ELSE 0 in setup.sql, extended to
+// also recognize the WALLET_ prefixed variant so real credits on that path
+// aren't miscounted as debits.
+const LEDGER_CREDIT_TYPES = new Set(["CREDIT", "WALLET_CREDIT"]);
+const LEDGER_DEBIT_TYPES = new Set(["DEBIT", "WALLET_DEBIT"]);
+function ledgerEntryDelta(entry) {
+  if (LEDGER_CREDIT_TYPES.has(entry.entry_type)) return entry.amount;
+  if (LEDGER_DEBIT_TYPES.has(entry.entry_type)) return -entry.amount;
+  return 0;
+}
 const axios = require("axios");
 
 // ONLY NOW declare app
@@ -6236,10 +6269,12 @@ app.post(
       description,
       transfer_auth_token,
     } = req.body;
-    const requestId =
-      req.headers["idempotency-key"] ||
-      req.body.requestId ||
-      crypto.randomUUID();
+    // FIXED: same UUID-format issue as adjust-balance below — process_transfer's
+    // p_request_id is UUID-typed too, so this route was equally exposed to
+    // the auto-generated `${Date.now()}-${random}` Idempotency-Key header.
+    const requestId = safeRequestId(
+      req.headers["idempotency-key"] || req.body.requestId,
+    );
 
     try {
       if (!from_account_id || !to_account_number || !amount || amount <= 0) {
@@ -12725,11 +12760,11 @@ app.get(
         if (!balances[entry.user_id]) {
           balances[entry.user_id] = 0;
         }
-        if (entry.entry_type === "CREDIT") {
-          balances[entry.user_id] += entry.amount;
-        } else {
-          balances[entry.user_id] -= entry.amount;
-        }
+        // FIXED: was `entry_type === "CREDIT" ? += : -=`, which treated
+        // WALLET_DEBIT_RESERVED / WALLET_DEBIT_RESERVE_RELEASE memo rows as
+        // real debits (double-counting every reserve-then-complete transfer)
+        // and miscounted WALLET_CREDIT rows as debits. See ledgerEntryDelta().
+        balances[entry.user_id] += ledgerEntryDelta(entry);
       }
 
       if (user_id) {
@@ -12772,11 +12807,9 @@ app.get(
         if (!ledgerBalances[entry.user_id]) {
           ledgerBalances[entry.user_id] = 0;
         }
-        if (entry.entry_type === "CREDIT") {
-          ledgerBalances[entry.user_id] += entry.amount;
-        } else {
-          ledgerBalances[entry.user_id] -= entry.amount;
-        }
+        // FIXED: see ledgerEntryDelta() — was double-counting reservation
+        // memo rows as real debits.
+        ledgerBalances[entry.user_id] += ledgerEntryDelta(entry);
       }
 
       // Get current account balances
@@ -12931,11 +12964,11 @@ app.post(
         if (!ledgerBalances[entry.user_id]) {
           ledgerBalances[entry.user_id] = 0;
         }
-        if (entry.entry_type === "CREDIT") {
-          ledgerBalances[entry.user_id] += entry.amount;
-        } else {
-          ledgerBalances[entry.user_id] -= entry.amount;
-        }
+        // FIXED: see ledgerEntryDelta() — was double-counting reservation
+        // memo rows as real debits. This route also writes reconciliation_alerts
+        // for anything over ₦1000, so the bug was actively generating false
+        // "critical" alerts for every external transfer over that amount.
+        ledgerBalances[entry.user_id] += ledgerEntryDelta(entry);
       }
 
       // Find discrepancies
@@ -13135,7 +13168,16 @@ app.post(
   async (req, res) => {
     const { userId } = req.params;
     const { amount, direction, reason } = req.body;
-    const requestId = req.headers["idempotency-key"] || crypto.randomUUID();
+    // FIXED: was `req.headers["idempotency-key"] || crypto.randomUUID()`.
+    // process_admin_balance_adjustment's p_request_id is UUID-typed, and
+    // the client's auto-generated Idempotency-Key header used to be
+    // `${Date.now()}-${random}` (not a UUID) whenever admin.js's
+    // adjustBalance() didn't set its own — which it never did. That's
+    // exactly the "invalid input syntax for type uuid" 500 in the logs.
+    // Fixed at the source in backend-config.js; safeRequestId() is a
+    // backstop here so a bad header degrades to a fresh UUID instead of
+    // crashing the RPC.
+    const requestId = safeRequestId(req.headers["idempotency-key"]);
 
     try {
       if (!amount || amount <= 0) {
