@@ -310,12 +310,21 @@ const { sendToToken, sendToTokens } = require("../lib/fcm-service");
 // crediting on their first attempt.
 app.get("/api/cron/deposit-webhooks", depositWebhookService.cronHandler);
 
-/*const AI_SERVICE_URL = process.env.AI_SERVICE_URL || "http://localhost:8001";
-const AI_SERVICE_API_KEY =
-  process.env.AI_SERVICE_API_KEY || "face-auth-key-2024";*/
+app.post("/api/webhooks/monnify", monnifyWebhookHandler.handleMonnifyWebhook);
 
-// Face verification state tracking (in production, use Redis)
-//const faceVerificationStates = new Map(); // session_id -> { user_id, timestamp, attempts }
+app.post("/api/webhooks/paystack",
+     express.raw({ type: "application/json" }),
+     (req, res) => {
+       req.rawBody = req.body; // Buffer — needed for signature chec       req.body = JSON.parse(req.body.toString("utf8"));
+       paystackWebhookHandler.handlePaystackWebhook(req, res);
+    });
+
+ const serviceRegistryAdminRouter = require("../lib/service-registry-admin-routes");
+ app.use("/api/sys/service-registry", authenticate, authorizeAdmin, serviceRegistryAdminRouter);
+
+   const vatAdminRouter = require("../lib/vat-admin-routes");
+   app.use("/api/sys/vat-config", authenticate, authorizeAdmin, vatAdminRouter);
+
 
 // Configure VAPID for web push - ADD THIS SECTION
 webpush.setVapidDetails(
