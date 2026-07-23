@@ -286,48 +286,6 @@ const {
   bumpUserCacheVersion,
 } = require("../lib/cache-service");
 
-// Cron sweep: retries any create_virtual_account jobs the fast path missed,
-// on their exponential backoff schedule. Wire this to Vercel Cron in
-// vercel.json — see the deployment notes.
-app.get("/api/cron/virtual-accounts", virtualAccountWorker.cronHandler);
-
-// Deposit webhook endpoint — intentionally NOT behind the authenticate
-// middleware, Flutterwave calls this directly.
-
-const statementService = require("../lib/statement-service");
-
-app.post(
-  "/api/webhooks/flutterwave",
-  depositWebhookService.handleFlutterwaveWebhook,
-);
-
-const billsCatalogRouter = require("../lib/bills-catalog-routes");
-const billsAdminRouter = require("../lib/bills-admin-routes");
-
-const { sendToToken, sendToTokens } = require("../lib/fcm-service");
-
-// Cron sweep: retries any deposit webhooks that failed verification or
-// crediting on their first attempt.
-app.get("/api/cron/deposit-webhooks", depositWebhookService.cronHandler);
-
-const monnifyWebhookHandler = require("../lib/monnify-webhook-handler");
-app.post("/api/webhooks/monnify", monnifyWebhookHandler.handleMonnifyWebhook);
-
-const paystackWebhookHandler = require("../lib/paystack-webhook-handler");
-
-app.post("/api/webhooks/paystack",
-     express.raw({ type: "application/json" }),
-     (req, res) => {
-       req.rawBody = req.body; // Buffer — needed for signature chec       req.body = JSON.parse(req.body.toString("utf8"));
-       paystackWebhookHandler.handlePaystackWebhook(req, res);
-    });
-
- const serviceRegistryAdminRouter = require("../lib/service-registry-admin-routes");
- app.use("/api/sys/service-registry", authenticate, authorizeAdmin, serviceRegistryAdminRouter);
-
-   const vatAdminRouter = require("../lib/vat-admin-routes");
-   app.use("/api/sys/vat-config", authenticate, authorizeAdmin, vatAdminRouter);
-
 
 // Configure VAPID for web push - ADD THIS SECTION
 webpush.setVapidDetails(
@@ -1377,8 +1335,52 @@ async function checkSingleTransferLimit(userId, amount, userTier = null) {
   }
 }
 
-// ==================== SECURITY MONITORING ENDPOINTS ====================
+// Cron sweep: retries any create_virtual_account jobs the fast path missed,
+// on their exponential backoff schedule. Wire this to Vercel Cron in
+// vercel.json — see the deployment notes.
+app.get("/api/cron/virtual-accounts", virtualAccountWorker.cronHandler);
 
+// Deposit webhook endpoint — intentionally NOT behind the authenticate
+// middleware, Flutterwave calls this directly.
+
+const statementService = require("../lib/statement-service");
+
+app.post(
+  "/api/webhooks/flutterwave",
+  depositWebhookService.handleFlutterwaveWebhook,
+);
+
+const billsCatalogRouter = require("../lib/bills-catalog-routes");
+const billsAdminRouter = require("../lib/bills-admin-routes");
+
+const { sendToToken, sendToTokens } = require("../lib/fcm-service");
+
+
+// Cron sweep: retries any deposit webhooks that failed verification or
+// crediting on their first attempt.
+
+app.get("/api/cron/deposit-webhooks", depositWebhookService.cronHandler);
+
+const monnifyWebhookHandler = require("../lib/monnify-webhook-handler");
+app.post("/api/webhooks/monnify", monnifyWebhookHandler.handleMonnifyWebhook);
+
+const paystackWebhookHandler = require("../lib/paystack-webhook-handler");
+
+app.post("/api/webhooks/paystack",
+     express.raw({ type: "application/json" }),
+     (req, res) => {
+       req.rawBody = req.body; // Buffer — needed for signature chec       req.body = JSON.parse(req.body.toString("utf8"));
+       paystackWebhookHandler.handlePaystackWebhook(req, res);
+    });
+
+
+ const serviceRegistryAdminRouter = require("../lib/service-registry-admin-routes");
+ app.use("/api/sys/service-registry", authenticate, authorizeAdmin, serviceRegistryAdminRouter);
+
+   const vatAdminRouter = require("../lib/vat-admin-routes");
+   app.use("/api/sys/vat-config", authenticate, authorizeAdmin, vatAdminRouter);
+
+// ==================== SECURITY MONITORING ENDPOINTS ====================
 // Log security events
 app.post("/api/security/events", authenticate, async (req, res) => {
   try {
