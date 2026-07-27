@@ -1350,4 +1350,8 @@ module.exports = {
   processSavingsWithdrawal,
   getSavingsPoolAccount,
   updateSavingsPoolBalance,
+  // Exported for savings-generic-engine.js — reuses the exact same
+  // ledger-recording function rather than a second copy of it, so the
+  // two engines can never drift apart on how a ledger entry is shaped.
+  recordLedgerEntry,
 };

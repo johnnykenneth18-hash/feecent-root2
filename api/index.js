@@ -308,6 +308,14 @@ app.get("/api/cron/deposit-webhooks", depositWebhookService.cronHandler);
 
 const statementService = require("../lib/statement-service");
 
+const savingsAdminRouter = require("./services/savings-admin-routes");
+
+const savingsCatalogRouter = require("./services/savings-catalog-routes");
+
+const savingsGenericRouter = require("./services/savings-generic-routes");
+
+const savingsStatusRouter = require("./services/savings-status-route");
+
 app.post(
   "/api/webhooks/flutterwave",
   depositWebhookService.handleFlutterwaveWebhook,
@@ -16389,6 +16397,14 @@ app.post(
     }
   },
 );
+
+app.use("/api/sys/savings", authenticate, authorizeAdmin, savingsAdminRouter);
+
+app.use("/api/user/savings/catalog", authenticate, savingsCatalogRouter);
+
+app.use("/api/user/savings/generic", authenticate, savingsGenericRouter);
+
+app.use("/api/user/savings/status", authenticate, savingsStatusRouter);
 
 // ==================== USER ACCOUNT CLOSURE ROUTES ====================
 
