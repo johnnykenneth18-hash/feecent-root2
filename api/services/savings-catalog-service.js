@@ -13,7 +13,7 @@
 // and admin-authored status copy.
 
 const { createClient } = require("@supabase/supabase-js");
-const { cacheGet, cacheSet, cacheDel } = require("./cache-service");
+const { cacheGet, cacheSet, cacheDel } = require("../../lib/cache-service");
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
