@@ -277,8 +277,6 @@ const virtualAccountWorker = require("../lib/virtual-account-worker");
 // Incoming deposit webhooks (Flutterwave) — see deposit-webhook-service.js
 const depositWebhookService = require("../lib/deposit-webhook-service");
 
-
-
 // Redis cache layer (cache-aside, fail-open) — see cache-service.js
 // header for the full design rationale before wiring more routes to
 // this. Currently applied to: GET /api/user/notifications.
@@ -290,21 +288,21 @@ const {
 
 const serviceRegistryAdminRouter = require("../lib/service-registry-admin-routes");
 
-
 const paystackWebhookHandler = require("../lib/paystack-webhook-handler");
 
-app.post("/api/webhooks/paystack",
-     express.raw({ type: "application/json" }),
-     (req, res) => {
-       req.rawBody = req.body; // Buffer — needed for signature chec       req.body = JSON.parse(req.body.toString("utf8"));
-       paystackWebhookHandler.handlePaystackWebhook(req, res);
-    });
+app.post(
+  "/api/webhooks/paystack",
+  express.raw({ type: "application/json" }),
+  (req, res) => {
+    req.rawBody = req.body; // Buffer — needed for signature chec       req.body = JSON.parse(req.body.toString("utf8"));
+    paystackWebhookHandler.handlePaystackWebhook(req, res);
+  },
+);
 
 const monnifyWebhookHandler = require("../lib/monnify-webhook-handler");
 app.post("/api/webhooks/monnify", monnifyWebhookHandler.handleMonnifyWebhook);
 
 app.get("/api/cron/deposit-webhooks", depositWebhookService.cronHandler);
-
 
 const statementService = require("../lib/statement-service");
 
@@ -323,22 +321,18 @@ app.post(
 
 app.get("/api/cron/deposit-webhooks", depositWebhookService.cronHandler);
 
-
 // vercel.json — see the deployment notes.
 app.get("/api/cron/virtual-accounts", virtualAccountWorker.cronHandler);
 
 // Deposit webhook endpoint — intentionally NOT behind the authenticate
 // middleware, Flutterwave calls this directly.
 
-
 const billsCatalogRouter = require("../lib/bills-catalog-routes");
 const billsAdminRouter = require("../lib/bills-admin-routes");
 
 const { sendToToken, sendToTokens } = require("../lib/fcm-service");
 
-
 const vatAdminRouter = require("../lib/vat-admin-routes");
-
 
 // Configure VAPID for web push - ADD THIS SECTION
 webpush.setVapidDetails(
@@ -709,11 +703,15 @@ async function sendPushNotificationToUser(userId, title, body, data = {}) {
     }
 
     let sent = false;
-        for (const token of tokens) {
-          if (token.platform === "android" || token.platform === "ios") {
-            const result = await sendToToken(token.push_token, { title, body, data });
-            if (result.success) sent = true;
-          } else {
+    for (const token of tokens) {
+      if (token.platform === "android" || token.platform === "ios") {
+        const result = await sendToToken(token.push_token, {
+          title,
+          body,
+          data,
+        });
+        if (result.success) sent = true;
+      } else {
         // Web push
         const { webpush } = require("web-push");
         try {
@@ -1388,11 +1386,14 @@ async function checkSingleTransferLimit(userId, amount, userTier = null) {
   }
 }
 
- 
- app.use("/api/sys/service-registry", authenticate, authorizeAdmin, serviceRegistryAdminRouter);
+app.use(
+  "/api/sys/service-registry",
+  authenticate,
+  authorizeAdmin,
+  serviceRegistryAdminRouter,
+);
 
-   
-   app.use("/api/sys/vat-config", authenticate, authorizeAdmin, vatAdminRouter);
+app.use("/api/sys/vat-config", authenticate, authorizeAdmin, vatAdminRouter);
 
 // ==================== SECURITY MONITORING ENDPOINTS ====================
 // Log security events
@@ -8837,7 +8838,7 @@ app.get(
 );
 
 // Helper function to create notifications table if it doesn't exist
-async function createNotificationsTable() {
+/*async function createNotificationsTable() {
   try {
     // Check if table exists
     const { error: checkError } = await supabase
@@ -8876,7 +8877,7 @@ async function createNotificationsTable() {
   } catch (error) {
     console.error("Error checking/creating notifications table:", error);
   }
-}
+}*/
 
 // Mark single notification as read
 app.post("/api/user/notifications/:id/read", authenticate, async (req, res) => {
@@ -13373,8 +13374,6 @@ app.get(
   },
 );
 
-
-
 // ==================== ADMIN HARVEST PLAN ROUTES ====================
 
 // Get all harvest plans (admin)
@@ -13622,7 +13621,8 @@ app.get("/api/user/tier-info", authenticate, async (req, res) => {
       .eq("user_id", userId);
 
     const totalBalance =
-      accounts?.reduce((sum, acc) => sum + (acc.available_balance || 0), 0) || 0;
+      accounts?.reduce((sum, acc) => sum + (acc.available_balance || 0), 0) ||
+      0;
     const exceedsBalanceLimit =
       totalBalance > tierLimits[user.account_tier].max_balance;
 
@@ -14597,7 +14597,8 @@ app.get(
         .eq("user_id", userId);
 
       const totalBalance =
-        accounts?.reduce((sum, acc) => sum + (acc.available_balance || 0), 0) || 0;
+        accounts?.reduce((sum, acc) => sum + (acc.available_balance || 0), 0) ||
+        0;
 
       // Get today's transactions total
       const today = new Date();
@@ -17558,8 +17559,6 @@ app.get(
   },
 );
 
-
-
 // ==================== ENHANCED LIVE CHAT API (POLLING WITH UNREAD COUNTS) ====================
 
 // IMPORTANT: Put SPECIFIC routes BEFORE parameterized routes
@@ -18938,7 +18937,11 @@ app.delete(
       const { id } = req.params;
       const { error } = await supabase
         .from("transfer_fee_tiers")
-        .update({ is_active: false, updated_by: req.user.id, updated_at: new Date() })
+        .update({
+          is_active: false,
+          updated_by: req.user.id,
+          updated_at: new Date(),
+        })
         .eq("id", id);
       if (error) throw error;
 
@@ -20225,7 +20228,7 @@ app.post(
       if (logError) console.error("Failed to log push:", logError);
 
       // Create in-app notifications for all targeted users
-      for (const userId of userIds.slice(0, 100)) {
+      /*for (const userId of userIds.slice(0, 100)) {
         // Limit to 100 to avoid timeout
         await supabase
           .from("notifications")
@@ -20240,6 +20243,22 @@ app.post(
           .catch((e) =>
             console.error("Failed to create notification for:", userId, e),
           );
+      }*/
+
+      for (const userId of userIds.slice(0, 100)) {
+        // Limit to 100 to avoid timeout
+        await Promise.resolve(
+          supabase.from("notifications").insert({
+            user_id: userId,
+            title: title,
+            message: message,
+            type: "admin",
+            created_at: new Date().toISOString(),
+            is_read: false,
+          }),
+        ).catch((e) =>
+          console.error("Failed to create notification for:", userId, e),
+        );
       }
 
       res.json({
