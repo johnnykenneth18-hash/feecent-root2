@@ -19985,7 +19985,8 @@ app.get(
         supabase
           .from("user_push_tokens")
           .select("user_id", { count: "exact", head: true })
-          .eq("platform", "onesignal")
+          //.eq("platform", "onesignal")
+          .in("platform", ["android", "ios"]) 
           .eq("is_active", true),
       ]);
 
@@ -20063,7 +20064,8 @@ app.get(
         .from("user_push_tokens")
         .select("user_id")
         .in("user_id", userIds)
-        .eq("platform", "onesignal")
+        //.eq("platform", "onesignal")
+        .in("platform", ["android", "ios"]) 
         .eq("is_active", true);
 
       const pushEnabledUserIds = new Set(tokens?.map((t) => t.user_id) || []);
@@ -20130,7 +20132,8 @@ app.post(
           const { data: tokenUsers } = await supabase
             .from("user_push_tokens")
             .select("user_id")
-            .eq("platform", "onesignal")
+            //.eq("platform", "onesignal")
+            .in("platform", ["android", "ios"]) 
             .eq("is_active", true);
           userIds = [...new Set(tokenUsers?.map((t) => t.user_id) || [])];
           break;
@@ -20220,8 +20223,8 @@ app.post(
           target_type: target_type,
           target_user_ids: target_type === "specific" ? target_user_ids : null,
           recipient_count: userIds.length,
-          success_count: pushResult.success ? playerIds.length : 0,
-          failed_count: pushResult.success ? 0 : playerIds.length,
+          success_count: pushResult.successCount ? playerIds.length : 0,
+          failed_count: pushResult.failureCount ? 0 : playerIds.length,
           onesignal_notification_id: pushResult.notification_id || null,
         });
 
@@ -20261,7 +20264,7 @@ app.post(
         );
       }
 
-      res.json({
+      /*res.json({
         success: pushResult.success,
         notification_id: pushResult.notification_id,
         recipients_found: userIds.length,
@@ -20269,6 +20272,17 @@ app.post(
         message: pushResult.success
           ? `Push notification sent to ${playerIds.length} device(s)`
           : `Failed to send: ${pushResult.error}`,
+      });*/
+      res.json({
+        success: pushResult.successCount > 0,
+        recipients_found: userIds.length,
+        push_sent: playerIds.length,
+        success_count: pushResult.successCount,
+        failure_count: pushResult.failureCount,
+        message:
+          pushResult.successCount > 0
+            ? `Push notification sent to ${pushResult.successCount}/${playerIds.length} device(s)`
+            : `Failed to send to any device (${pushResult.failureCount} failed)`,
       });
     } catch (error) {
       console.error("Send push error:", error);
@@ -20335,7 +20349,8 @@ app.post(
         .from("user_push_tokens")
         .select("push_token")
         .eq("user_id", user_id)
-        .eq("platform", "onesignal")
+        //.eq("platform", "onesignal")
+        .in("platform", ["android", "ios"]) 
         .eq("is_active", true);
 
       if (!tokens || tokens.length === 0) {
