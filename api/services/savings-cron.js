@@ -3,7 +3,7 @@ const { createClient } = require("@supabase/supabase-js");
 const nodemailer = require("nodemailer");
 
 // e.g. inside your flutterwave-service.js, vtpass-service.js, paystack-webhook-handler.js
-const { notifyAndPush } = require("../../notification-service");
+const { notifyAndPush } = require("../../lib/notification-service");
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
