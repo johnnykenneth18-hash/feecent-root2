@@ -290,6 +290,8 @@ const serviceRegistryAdminRouter = require("../lib/service-registry-admin-routes
 
 const paystackWebhookHandler = require("../lib/paystack-webhook-handler");
 
+const { notifyAndPush, sendPushNotificationForInAppNotification } = require("../lib/notification-service");
+
 app.post(
   "/api/webhooks/paystack",
   express.raw({ type: "application/json" }),
@@ -761,7 +763,7 @@ async function testEmailConfig() {
 testEmailConfig();
 
 // Send push notification to user's device when in-app notification is created
-async function sendPushNotificationForInAppNotification(
+/*async function sendPushNotificationForInAppNotification(
   userId,
   title,
   message,
@@ -859,7 +861,7 @@ async function sendPushNotificationForInAppNotification(
     }*/
 
     // Send to all active tokens
-    for (const token of tokens) {
+    /*for (const token of tokens) {
       try {
         if (token.platform === "android" || token.platform === "ios") {
           const result = await sendToToken(token.push_token, {
@@ -902,7 +904,7 @@ async function sendPushNotificationForInAppNotification(
     console.error("Send push notification error:", error);
     return false;
   }
-}
+}*/
 
 // ==================== DEVICE TRUST & TRANSFER HISTORY ====================
 
@@ -4956,7 +4958,8 @@ async function checkAndFreezeIfBalanceExceeds(userId) {
 
       await bumpUserCacheVersion("authuser", userId);
 
-      await supabase.from("notifications").insert({
+      //insertawait supabase.from("notifications").
+      await notifyAndPush({
         user_id: userId,
         title: "Account Frozen - Balance Limit Exceeded",
         message: `Your balance (₦${totalBalance.toLocaleString()}) exceeds your Tier ${user.account_tier} limit of ₦${limits.max_balance.toLocaleString()}. Please upgrade your account to continue using our services.`,
@@ -7546,454 +7549,7 @@ app.get("/api/accounts/recipient", authenticate, async (req, res) => {
   }
 });
 
-// Get available fintech providers
-/*app.get("/api/external/providers", authenticate, async (req, res) => {
-  try {
-    const providers = [
-      {
-        id: "paypal",
-        name: "PayPal",
-        logo: "https://cdn.jsdelivr.net/gh/simple-icons/simple-icons/icons/paypal.svg",
-        color: "#003087",
-        fields: [
-          {
-            name: "recipient_email",
-            label: "PayPal Email",
-            type: "email",
-            required: true,
-          },
-          {
-            name: "recipient_name",
-            label: "Full Name",
-            type: "text",
-            required: true,
-          },
-        ],
-      },
-      {
-        id: "stripe",
-        name: "Stripe",
-        logo: "https://cdn.jsdelivr.net/gh/simple-icons/simple-icons/icons/stripe.svg",
-        color: "#635bff",
-        fields: [
-          {
-            name: "recipient_email",
-            label: "Stripe Account Email",
-            type: "email",
-            required: true,
-          },
-          {
-            name: "recipient_name",
-            label: "Business/Individual Name",
-            type: "text",
-            required: true,
-          },
-        ],
-      },
-      {
-        id: "flutterwave",
-        name: "Flutterwave",
-        logo: "https://cdn.jsdelivr.net/gh/simple-icons/simple-icons/icons/flutterwave.svg",
-        color: "#f9a825",
-        fields: [
-          {
-            name: "recipient_account",
-            label: "Account Number",
-            type: "text",
-            required: true,
-          },
-          {
-            name: "recipient_name",
-            label: "Account Holder Name",
-            type: "text",
-            required: true,
-          },
-          {
-            name: "recipient_email",
-            label: "Email (Optional)",
-            type: "email",
-            required: false,
-          },
-        ],
-      },
-      {
-        id: "paystack",
-        name: "Paystack",
-        logo: "https://cdn.jsdelivr.net/gh/simple-icons/simple-icons/icons/paystack.svg",
-        color: "#25c3f0",
-        fields: [
-          {
-            name: "recipient_account",
-            label: "Account Number",
-            type: "text",
-            required: true,
-          },
-          {
-            name: "recipient_name",
-            label: "Account Holder Name",
-            type: "text",
-            required: true,
-          },
-          {
-            name: "recipient_phone",
-            label: "Phone Number",
-            type: "tel",
-            required: true,
-          },
-        ],
-      },
-      {
-        id: "wise",
-        name: "Wise (TransferWise)",
-        logo: "https://cdn.jsdelivr.net/gh/simple-icons/simple-icons/icons/wise.svg",
-        color: "#00b9b9",
-        fields: [
-          {
-            name: "recipient_email",
-            label: "Wise Email",
-            type: "email",
-            required: true,
-          },
-          {
-            name: "recipient_name",
-            label: "Recipient Name",
-            type: "text",
-            required: true,
-          },
-          {
-            name: "recipient_account",
-            label: "Account Number (if applicable)",
-            type: "text",
-            required: false,
-          },
-        ],
-      },
-      {
-        id: "remitly",
-        name: "Remitly",
-        logo: "https://cdn.jsdelivr.net/gh/simple-icons/simple-icons/icons/remitly.svg",
-        color: "#00b9b9",
-        fields: [
-          {
-            name: "recipient_name",
-            label: "Recipient Name",
-            type: "text",
-            required: true,
-          },
-          {
-            name: "recipient_phone",
-            label: "Phone Number",
-            type: "tel",
-            required: true,
-          },
-          {
-            name: "recipient_country",
-            label: "Recipient Country",
-            type: "text",
-            required: true,
-          },
-        ],
-      },
-      {
-        id: "worldremit",
-        name: "WorldRemit",
-        logo: "https://cdn.jsdelivr.net/gh/simple-icons/simple-icons/icons/worldremit.svg",
-        color: "#00b9b9",
-        fields: [
-          {
-            name: "recipient_name",
-            label: "Recipient Name",
-            type: "text",
-            required: true,
-          },
-          {
-            name: "recipient_phone",
-            label: "Phone Number",
-            type: "tel",
-            required: true,
-          },
-        ],
-      },
-      {
-        id: "bank_transfer",
-        name: "Bank Transfer",
-        logo: "https://cdn.jsdelivr.net/gh/simple-icons/simple-icons/icons/bank.svg",
-        color: "#4f46e5",
-        fields: [
-          {
-            name: "bank_name",
-            label: "Bank Name",
-            type: "text",
-            required: true,
-          },
-          {
-            name: "recipient_account",
-            label: "Account Number",
-            type: "text",
-            required: true,
-          },
-          {
-            name: "recipient_name",
-            label: "Account Holder Name",
-            type: "text",
-            required: true,
-          },
-          {
-            name: "routing_number",
-            label: "Routing Number",
-            type: "text",
-            required: true,
-          },
-          {
-            name: "swift_code",
-            label: "SWIFT/BIC Code",
-            type: "text",
-            required: false,
-          },
-        ],
-      },
-    ];
 
-    res.json(providers);
-  } catch (error) {
-    console.error("Error fetching providers:", error);
-    res.status(500).json({ error: "Failed to fetch providers" });
-  }
-});
-
-// Create external transfer request
-app.post(
-  "/api/user/external-transfer",
-  authenticate,
-  checkAccountFrozen,
-  async (req, res) => {
-    console.log("=== External Transfer Request Received ===");
-    console.log("User ID:", req.user?.id);
-    console.log("Request body:", req.body);
-
-    try {
-      const {
-        from_account_id,
-        provider_id,
-        recipient_name,
-        recipient_account,
-        recipient_email,
-        recipient_phone,
-        amount,
-        description,
-        bank_name,
-      } = req.body;
-
-      console.log("Parsed data:", {
-        from_account_id,
-        provider_id,
-        amount,
-        bank_name,
-      });
-
-      // Validate amount
-      if (!amount || amount <= 0) {
-        console.log("Invalid amount:", amount);
-        return res.status(400).json({ error: "Invalid amount" });
-      }
-
-      if (amount < 10000) {
-        return res
-          .status(400)
-          .json({ error: "Minimum external transfer amount is ₦10,000" });
-      }
-
-      if (amount > 15000000) {
-        return res
-          .status(400)
-          .json({ error: "Maximum external transfer amount is ₦15,000,000" });
-      }
-
-      // Get source account
-      console.log("Fetching source account:", from_account_id);
-      const { data: fromAccount, error: accountError } = await supabase
-        .from("accounts")
-        .select("*")
-        .eq("id", from_account_id)
-        .eq("user_id", req.user.id)
-        .single();
-
-      if (accountError) {
-        console.error("Account fetch error:", accountError);
-        return res.status(404).json({
-          error: "Source account not found",
-          details: accountError.message,
-        });
-      }
-
-      if (!fromAccount) {
-        console.log("No account found for ID:", from_account_id);
-        return res.status(404).json({ error: "Source account not found" });
-      }
-
-      console.log(
-        "Source account found:",
-        fromAccount.account_number,
-        "Balance:",
-        fromAccount.available_balance,
-      );
-
-      // Check sufficient funds
-      if (fromAccount.available_balance < amount) {
-        return res.status(400).json({ error: "Insufficient funds" });
-      }
-
-      // Get provider name
-      let providerName = bank_name;
-      if (provider_id) {
-        const providers = {
-          paypal: "PayPal",
-          stripe: "Stripe",
-          flutterwave: "Flutterwave",
-          paystack: "Paystack",
-          wise: "Wise",
-          remitly: "Remitly",
-          worldremit: "WorldRemit",
-          bank_transfer: "Bank Transfer",
-        };
-        providerName = providers[provider_id] || bank_name || provider_id;
-      }
-
-      // Create external transfer record
-      const transferData = {
-        user_id: req.user.id,
-        from_account_id: fromAccount.id,
-        bank_name: providerName,
-        recipient_name: recipient_name,
-        recipient_account: recipient_account || null,
-        recipient_email: recipient_email || null,
-        recipient_phone: recipient_phone || null,
-        amount: amount,
-        description: description || `External transfer to ${providerName}`,
-        status: "pending",
-        created_at: new Date().toISOString(),
-      };
-
-      console.log("Inserting transfer record:", transferData);
-
-      const { data: transfer, error: insertError } = await supabase
-        .from("external_transfers")
-        .insert(transferData)
-        .select()
-        .single();
-
-      if (insertError) {
-        console.error("Insert error:", insertError);
-        return res.status(500).json({
-          error: "Failed to create transfer record",
-          details: insertError.message,
-        });
-      }
-
-      console.log("Transfer record created:", transfer.id);
-
-      // Immediately deduct amount from user balance
-      const { error: updateError } = await supabase
-        .from("accounts")
-        .update({
-          balance: fromAccount.balance - amount,
-          available_balance: fromAccount.available_balance - amount,
-          updated_at: new Date().toISOString(),
-        })
-        .eq("id", fromAccount.id);
-
-      if (updateError) {
-        console.error("Balance update error:", updateError);
-        // Rollback would be ideal here, but for now log it
-      }
-
-      // Create transaction record for the deduction
-      // NOTE: this /api/user/external-transfer route predates the
-      // Flutterwave payout integration (/api/flutterwave/transfer) —
-      // confirm whether it's still reachable from the frontend or safe
-      // to remove, since it duplicates that flow.
-      const { error: transError } = await supabase.from("transactions_new").insert({
-        sender_account_id: fromAccount.id,
-        sender_user_id: req.user.id,
-        amount: amount,
-        description: `External transfer to ${providerName} - ${recipient_name} (Pending approval)`,
-        transaction_type: "external_transfer",
-        status: "completed",
-        completed_at: new Date().toISOString(),
-        metadata: { is_admin_adjusted: false },
-      });
-
-      if (transError) {
-        console.error("Transaction creation error:", transError);
-      }
-
-      // Create notification for user
-      await supabase.from("notifications").insert({
-        user_id: req.user.id,
-        title: "External Transfer Initiated",
-        message: `Your transfer of $${amount} to ${providerName} has been initiated. Funds have been deducted from your account and will be processed within 2-3 business days after approval.`,
-        type: "info",
-        created_at: new Date().toISOString(),
-      });
-
-      console.log("External transfer completed successfully");
-      res.json({
-        success: true,
-        message:
-          "External transfer initiated successfully. Funds will be processed within 2-3 business days.",
-        transfer: transfer,
-        estimated_completion: "2-3 business days",
-      });
-    } catch (error) {
-      console.error("External transfer error - FULL DETAILS:", error);
-      console.error("Error stack:", error.stack);
-      res.status(500).json({
-        error: "Failed to process external transfer",
-        details: error.message,
-        stack: process.env.NODE_ENV === "development" ? error.stack : undefined,
-      });
-    }
-  },
-);
-
-// Get user's external transfer history
-app.get("/api/user/external-transfers", authenticate, async (req, res) => {
-  try {
-    const { page = 1, limit = 20, status } = req.query;
-    const offset = (page - 1) * limit;
-
-    let query = supabase
-      .from("external_transfers")
-      .select("*", { count: "exact" })
-      .eq("user_id", req.user.id)
-      .order("created_at", { ascending: false });
-
-    if (status && status !== "all") {
-      query = query.eq("status", status);
-    }
-
-    const {
-      data: transfers,
-      error,
-      count,
-    } = await query.range(offset, offset + limit - 1);
-
-    if (error) throw error;
-
-    res.json({
-      transfers: transfers || [],
-      pagination: {
-        page: parseInt(page),
-        limit: parseInt(limit),
-        total: count || 0,
-        pages: Math.ceil((count || 0) / limit),
-      },
-    });
-  } catch (error) {
-    console.error("Error fetching external transfers:", error);
-    res.status(500).json({ error: "Failed to fetch external transfers" });
-  }
-});*/
 
 // Verify OTP and complete transaction
 app.post("/api/user/verify-otp", authenticate, async (req, res) => {
@@ -10937,7 +10493,8 @@ app.post(
       });
 
       // ========== Create notification ==========
-      await supabase.from("notifications").insert({
+      //await supabase.from("notifications").insert
+      await notifyAndPush({
         user_id: req.user.id,
         title: "Savings Withdrawal Successful",
         message: `You have successfully withdrawn ₦${withdrawAmount.toLocaleString()} from your ${type} savings.${feeAmount > 0 ? ` A fee of ₦${feeAmount.toLocaleString()} was applied.` : ""}`,
@@ -10961,591 +10518,6 @@ app.post(
   },
 );
 
-// ============================================================
-// SAVINGS WITHDRAWAL API - PRODUCTION GRADE
-// ============================================================
-// Add this to your index.js file
-// REPLACE the existing /api/user/savings/:type/:id/withdraw endpoint
-
-/*app.post(
-  "/api/user/savings/:type/:id/withdraw",
-  authenticate,
-  checkAccountFrozen,
-  preventConcurrentTransfer,
-  releaseTransactionLock,
-  async (req, res) => {
-    const { type, id } = req.params;
-    const { amount } = req.body;
-    const requestId =
-      req.headers["idempotency-key"] ||
-      req.body.requestId ||
-      crypto.randomUUID();
-
-    try {
-      console.log(
-        `[Savings Withdrawal] User ${req.user.id} requesting withdrawal from ${type} savings ${id}`,
-      );
-
-      // ============================================================
-      // 1. VALIDATE INPUT
-      // ============================================================
-      if (!type || !id) {
-        return res.status(400).json({
-          error: "Savings type and ID required",
-          code: "MISSING_FIELDS",
-        });
-      }
-
-      // ============================================================
-      // 2. GET SAVINGS RECORD
-      // ============================================================
-      let tableName = "";
-      let savingsRecord = null;
-
-      switch (type) {
-        case "harvest":
-          tableName = "user_harvest_enrollments";
-          const { data: harvest, error: hError } = await supabase
-            .from("user_harvest_enrollments")
-            .select(
-              `
-              *,
-              users!inner(id, email, first_name, last_name, is_frozen),
-              harvest_plans!inner(
-                id, 
-                name, 
-                daily_amount, 
-                duration_days, 
-                total_amount,
-                reward_items
-              )
-            `,
-            )
-            .eq("id", id)
-            .eq("user_id", req.user.id)
-            .single();
-
-          if (hError) throw hError;
-          savingsRecord = harvest;
-          break;
-
-        case "fixed":
-          tableName = "fixed_savings";
-          const { data: fixed, error: fError } = await supabase
-            .from("fixed_savings")
-            .select(
-              `
-              *,
-              users!inner(id, email, first_name, last_name, is_frozen)
-            `,
-            )
-            .eq("id", id)
-            .eq("user_id", req.user.id)
-            .single();
-
-          if (fError) throw fError;
-          savingsRecord = fixed;
-          break;
-
-        case "savebox":
-          tableName = "savebox_savings";
-          const { data: savebox, error: sError } = await supabase
-            .from("savebox_savings")
-            .select(
-              `
-              *,
-              users!inner(id, email, first_name, last_name, is_frozen)
-            `,
-            )
-            .eq("id", id)
-            .eq("user_id", req.user.id)
-            .single();
-
-          if (sError) throw sError;
-          savingsRecord = savebox;
-          break;
-
-        case "target":
-          tableName = "target_savings";
-          const { data: target, error: tError } = await supabase
-            .from("target_savings")
-            .select(
-              `
-              *,
-              users!inner(id, email, first_name, last_name, is_frozen)
-            `,
-            )
-            .eq("id", id)
-            .eq("user_id", req.user.id)
-            .single();
-
-          if (tError) throw tError;
-          savingsRecord = target;
-          break;
-
-        case "spare_change":
-          tableName = "spare_change_savings";
-          const { data: spare, error: spError } = await supabase
-            .from("spare_change_savings")
-            .select(
-              `
-              *,
-              users!inner(id, email, first_name, last_name, is_frozen)
-            `,
-            )
-            .eq("id", id)
-            .eq("user_id", req.user.id)
-            .single();
-
-          if (spError) throw spError;
-          savingsRecord = spare;
-          break;
-
-        default:
-          return res.status(400).json({
-            error: "Invalid savings type",
-            code: "INVALID_SAVINGS_TYPE",
-          });
-      }
-
-      if (!savingsRecord) {
-        return res.status(404).json({
-          error: "Savings record not found",
-          code: "SAVINGS_NOT_FOUND",
-        });
-      }
-
-      if (savingsRecord.users?.is_frozen) {
-        return res.status(403).json({
-          error: "Account is frozen",
-          code: "ACCOUNT_FROZEN",
-        });
-      }
-
-      // ============================================================
-      // 3. VALIDATE WITHDRAWAL CONDITIONS
-      // ============================================================
-
-      // Check if already withdrawn
-      if (savingsRecord.status === "withdrawn") {
-        return res.status(400).json({
-          error: "This savings has already been withdrawn",
-          code: "ALREADY_WITHDRAWN",
-        });
-      }
-
-      // Check if active
-      if (
-        savingsRecord.status !== "active" &&
-        savingsRecord.status !== "matured"
-      ) {
-        return res.status(400).json({
-          error: "This savings is not active or matured",
-          code: "SAVINGS_NOT_ACTIVE",
-        });
-      }
-
-      // Calculate withdrawal amount and fees
-      let withdrawAmount = 0;
-      let feeAmount = 0;
-      let feePercentage = 0;
-      let canWithdraw = false;
-      let message = "";
-
-      const today = new Date();
-
-      switch (type) {
-        case "harvest":
-          // Harvest plans require admin approval - redirect to request flow
-          return res.status(400).json({
-            error:
-              "Harvest plan withdrawals require admin approval. Please use the withdrawal request feature.",
-            code: "ADMIN_APPROVAL_REQUIRED",
-            requires_admin_approval: true,
-          });
-
-        case "fixed":
-          const fixedMaturityDate = new Date(savingsRecord.maturity_date);
-          const isMatured = fixedMaturityDate <= today;
-
-          if (!isMatured) {
-            return res.status(400).json({
-              error: "Fixed savings has not matured yet",
-              code: "NOT_MATURED",
-              maturity_date: fixedMaturityDate.toISOString(),
-              days_remaining: Math.ceil(
-                (fixedMaturityDate - today) / (1000 * 60 * 60 * 24),
-              ),
-            });
-          }
-
-          // Calculate interest
-          const interest =
-            (savingsRecord.current_saved || 0) *
-            (savingsRecord.interest_rate / 100);
-          withdrawAmount = (savingsRecord.current_saved || 0) + interest;
-
-          // Check free withdrawal period
-          const freeWithdrawalDate = new Date(
-            savingsRecord.next_free_withdrawal_date,
-          );
-          const isFreeWithdrawal = today <= freeWithdrawalDate;
-
-          if (!isFreeWithdrawal) {
-            feePercentage = 2; // 2% fee after free period
-            feeAmount = withdrawAmount * (feePercentage / 100);
-            withdrawAmount = withdrawAmount - feeAmount;
-          }
-
-          canWithdraw = true;
-          message = `${isFreeWithdrawal ? "Free" : feePercentage + "%"} withdrawal. Amount: ₦${withdrawAmount.toLocaleString()}`;
-          break;
-
-        case "savebox":
-          const targetDate = new Date(savingsRecord.target_date);
-          const isTargetReached =
-            today >= targetDate ||
-            (savingsRecord.current_saved || 0) >= (savingsRecord.amount || 0);
-
-          withdrawAmount = savingsRecord.current_saved || 0;
-
-          if (withdrawAmount <= 0) {
-            return res.status(400).json({
-              error: "No funds available to withdraw",
-              code: "NO_FUNDS",
-            });
-          }
-
-          if (!isTargetReached) {
-            feePercentage = savingsRecord.early_withdrawal_fee_percent || 4;
-            feeAmount = withdrawAmount * (feePercentage / 100);
-            withdrawAmount = withdrawAmount - feeAmount;
-          }
-
-          canWithdraw = true;
-          message = `${isTargetReached ? "No" : feePercentage + "%"} fee applied. You will receive ₦${withdrawAmount.toLocaleString()}`;
-          break;
-
-        case "target":
-          const withdrawalDate = new Date(savingsRecord.withdrawal_date);
-          const isTargetMet =
-            savingsRecord.target_met ||
-            (savingsRecord.current_saved || 0) >=
-              (savingsRecord.target_amount || 0);
-          const canWithdrawTarget = isTargetMet || withdrawalDate <= today;
-
-          if (!canWithdrawTarget) {
-            return res.status(400).json({
-              error: "Target savings goal has not been reached yet",
-              code: "TARGET_NOT_REACHED",
-              target_amount: savingsRecord.target_amount,
-              current_saved: savingsRecord.current_saved,
-              withdrawal_date: savingsRecord.withdrawal_date,
-              days_remaining: Math.ceil(
-                (withdrawalDate - today) / (1000 * 60 * 60 * 24),
-              ),
-            });
-          }
-
-          withdrawAmount = savingsRecord.current_saved || 0;
-
-          if (withdrawAmount <= 0) {
-            return res.status(400).json({
-              error: "No funds available to withdraw",
-              code: "NO_FUNDS",
-            });
-          }
-
-          canWithdraw = true;
-          message = `Full withdrawal of ₦${withdrawAmount.toLocaleString()}`;
-          break;
-
-        case "spare_change":
-          withdrawAmount = savingsRecord.current_saved || 0;
-
-          if (withdrawAmount <= 0) {
-            return res.status(400).json({
-              error: "No funds available to withdraw",
-              code: "NO_FUNDS",
-            });
-          }
-
-          canWithdraw = true;
-          feeAmount = 0;
-          message = `Full withdrawal of ₦${withdrawAmount.toLocaleString()} (No fees)`;
-          break;
-
-        default:
-          return res.status(400).json({
-            error: "Invalid savings type for withdrawal",
-            code: "INVALID_TYPE",
-          });
-      }
-
-      if (!canWithdraw) {
-        return res.status(400).json({
-          error: "Cannot withdraw from this savings at this time",
-          code: "WITHDRAWAL_NOT_ALLOWED",
-        });
-      }
-
-      if (withdrawAmount <= 0) {
-        return res.status(400).json({
-          error: "Withdrawal amount is zero or negative",
-          code: "ZERO_AMOUNT",
-        });
-      }
-
-      // ============================================================
-      // 4. GET USER'S CHECKING ACCOUNT
-      // ============================================================
-      const { data: account, error: accError } = await supabase
-        .from("accounts")
-        .select("*")
-        .eq("user_id", req.user.id)
-        .eq("account_type", "checking")
-        .single();
-
-      if (accError || !account) {
-        return res.status(404).json({
-          error: "User account not found",
-          code: "ACCOUNT_NOT_FOUND",
-        });
-      }
-
-      // ============================================================
-      // 5. GET SAVINGS POOL ACCOUNT
-      // ============================================================
-      let poolType = "";
-      switch (type) {
-        case "fixed":
-          poolType = "fixed_pool";
-          break;
-        case "savebox":
-          poolType = "savebox_pool";
-          break;
-        case "target":
-          poolType = "target_pool";
-          break;
-        case "spare_change":
-          poolType = "spare_change_pool";
-          break;
-        default:
-          poolType = "fixed_pool";
-      }
-
-      const { data: poolAccount, error: poolError } = await supabase
-        .from("savings_pool_accounts")
-        .select("*")
-        .eq("account_type", poolType)
-        .single();
-
-      if (poolError || !poolAccount) {
-        console.error(`Pool account ${poolType} not found:`, poolError);
-        return res.status(500).json({
-          error: "Savings pool account not found",
-          code: "POOL_NOT_FOUND",
-        });
-      }
-
-      // Check if pool has sufficient funds
-      if (poolAccount.balance < withdrawAmount + feeAmount) {
-        console.error(
-          `Insufficient pool funds: ${poolType} balance ₦${poolAccount.balance}, required ₦${withdrawAmount + feeAmount}`,
-        );
-        return res.status(500).json({
-          error: "Insufficient pool funds. Please contact support.",
-          code: "POOL_INSUFFICIENT",
-        });
-      }
-
-      // ============================================================
-      // 6. EXECUTE WITHDRAWAL TRANSACTION USING FinancialTransactionService
-      // ============================================================
-      const FinancialTransactionService = require("../services/FinancialTransactionService");
-      const transactionService = new FinancialTransactionService();
-
-      // Prepare debits and credits
-      let debits = [];
-      let credits = [];
-
-      // DEBIT: From savings pool account
-      debits.push({
-        accountId: poolAccount.id,
-        amount: withdrawAmount + feeAmount,
-        reason: `Savings withdrawal from ${type} pool`,
-      });
-
-      // CREDIT: To user's checking account
-      credits.push({
-        accountId: account.id,
-        amount: withdrawAmount,
-        reason: `Savings withdrawal from ${type}`,
-      });
-
-      // CREDIT: Fee to fee account (if applicable)
-      if (feeAmount > 0) {
-        const { data: feeAccount } = await supabase
-          .from("savings_pool_accounts")
-          .select("*")
-          .eq("account_type", "fee_account")
-          .single();
-
-        if (feeAccount) {
-          credits.push({
-            accountId: feeAccount.id,
-            amount: feeAmount,
-            reason: `Savings withdrawal fee (${feePercentage}%) from ${type}`,
-          });
-        } else {
-          console.warn("Fee account not found - fee will not be collected");
-        }
-      }
-
-      // Execute transaction
-      const result = await transactionService.executeTransaction({
-        requestId: requestId,
-        userId: req.user.id,
-        type: "SAVINGS_WITHDRAWAL",
-        description: `Withdrawal from ${type} savings: ${message}`,
-        debits: debits,
-        credits: credits,
-        metadata: {
-          ip: req.ip,
-          userAgent: req.headers["user-agent"],
-          savings_type: type,
-          savings_id: id,
-          fee_amount: feeAmount,
-          fee_percentage: feePercentage,
-          withdraw_amount: withdrawAmount,
-        },
-      });
-
-      // ============================================================
-      // 7. UPDATE SAVINGS RECORD STATUS
-      // ============================================================
-      const { error: updateError } = await supabase
-        .from(tableName)
-        .update({
-          status: "withdrawn",
-          updated_at: new Date().toISOString(),
-        })
-        .eq("id", id);
-
-      if (updateError) {
-        console.error(`Failed to update ${type} savings status:`, updateError);
-        // Don't return error - transaction already completed
-      }
-
-      // ============================================================
-      // 8. CREATE SAVINGS TRANSACTION RECORD
-      // ============================================================
-      const { error: savingsTxError } = await supabase
-        .from("savings_transactions")
-        .insert({
-          user_id: req.user.id,
-          savings_type: type,
-          savings_id: id,
-          amount: withdrawAmount,
-          fee_amount: feeAmount,
-          transaction_type: "withdrawal",
-          description: `Withdrawn from ${type} savings${feeAmount > 0 ? `, fee: ₦${feeAmount}` : ""}`,
-          from_pool_account_id: poolAccount.id,
-          to_pool_account_id:
-            feeAmount > 0
-              ? (
-                  await supabase
-                    .from("savings_pool_accounts")
-                    .select("id")
-                    .eq("account_type", "fee_account")
-                    .single()
-                ).data?.id
-              : null,
-          processed_by: req.user.id,
-          processed_at: new Date().toISOString(),
-        });
-
-      if (savingsTxError) {
-        console.error("Savings transaction error:", savingsTxError);
-      }
-
-      // ============================================================
-      // 9. CREATE NOTIFICATION
-      // ============================================================
-      await supabase.from("notifications").insert({
-        user_id: req.user.id,
-        title: "Savings Withdrawal Successful",
-        message: `You have successfully withdrawn ₦${withdrawAmount.toLocaleString()} from your ${type} savings.${feeAmount > 0 ? ` A fee of ₦${feeAmount.toLocaleString()} was applied.` : ""}`,
-        type: "success",
-        created_at: new Date().toISOString(),
-      });
-
-      // ============================================================
-      // 10. RETURN SUCCESS RESPONSE
-      // ============================================================
-      console.log(
-        `✅ Savings withdrawal completed: User ${req.user.id}, Type ${type}, Amount ₦${withdrawAmount}, Fee ₦${feeAmount}`,
-      );
-
-      res.json({
-        success: true,
-        message: "Withdrawal completed successfully",
-        data: {
-          savings_type: type,
-          savings_id: id,
-          amount_withdrawn: withdrawAmount,
-          fee_charged: feeAmount,
-          fee_percentage: feePercentage,
-          new_balance:
-            result.balances.find((b) => b.accountId === account.id)
-              ?.balanceAfter || 0,
-          transaction_reference: result.transactionReference,
-          completed_at: new Date().toISOString(),
-        },
-      });
-    } catch (error) {
-      console.error("[Savings Withdrawal Error]", error);
-
-      // ============================================================
-      // ERROR HANDLING
-      // ============================================================
-
-      // Idempotency error
-      if (error.message === "Duplicate transaction detected") {
-        return res.status(409).json({
-          error: "Duplicate transaction detected",
-          code: "DUPLICATE_TRANSACTION",
-          message: "This withdrawal has already been processed",
-        });
-      }
-
-      // Insufficient balance in pool
-      if (error.message.includes("Insufficient balance")) {
-        return res.status(400).json({
-          error: "Insufficient pool balance",
-          code: "POOL_INSUFFICIENT",
-          message: "Please contact support",
-        });
-      }
-
-      // Database transaction error
-      if (error.message.includes("Failed to insert ledger entry")) {
-        return res.status(500).json({
-          error: "Ledger entry failed",
-          code: "LEDGER_FAILED",
-          message: "Please contact support",
-        });
-      }
-
-      // Generic error
-      res.status(500).json({
-        error: "Withdrawal failed",
-        code: "WITHDRAWAL_FAILED",
-        message: error.message,
-      });
-    }
-  },
-);*/
 
 // Cancel savings plan (stop auto-save but keep saved amount)
 app.post(
@@ -11817,7 +10789,8 @@ app.post(
       });
 
       // Create notification for user
-      await supabase.from("notifications").insert({
+      //await supabase.from("notifications").insert
+      await notifyAndPush ({
         user_id: req.user.id,
         title: "Add-Up Contribution Successful",
         message: `You added ₦${amount.toLocaleString()} to your ${enrollment.harvest_plans.name} plan. ${additionalDays} days of savings added!`,
@@ -12042,7 +11015,8 @@ app.post("/api/user/verify-unfreeze-otp", authenticate, async (req, res) => {
     await bumpUserCacheVersion("authuser", req.user.id);
 
     // Create notification
-    await supabase.from("notifications").insert({
+    //await supabase.from("notifications").insert
+    await notifyAndPush ({
       user_id: req.user.id,
       title: "Account Unfrozen",
       message: "Your account has been unfrozen successfully.",
@@ -12191,7 +11165,7 @@ app.post("/api/user/add-money", authenticate, async (req, res) => {
 });
 
 // Bill payment
-app.post(
+/*app.post(
   "/api/user/bill-payment",
   authenticate,
   checkAccountFrozen,
@@ -12258,7 +11232,7 @@ app.post(
       res.status(500).json({ error: "Payment failed" });
     }
   },
-);
+);*/
 
 // ============================================================
 // UPDATED LEDGER API ENDPOINTS - Add to index.js
@@ -13045,150 +12019,6 @@ app.post(
     }
   },
 );
-
-// ==================== CREATE ADJUSTMENT ====================
-/*app.post(
-  "/api/sys/users/:userId/adjust-balance",
-  authenticate,
-  authorizeAdmin,
-  async (req, res) => {
-    const { userId } = req.params;
-    const { amount, direction, reason } = req.body;
-    const requestId = req.headers["idempotency-key"] || crypto.randomUUID();
-
-    try {
-      // Validate
-      if (!amount || amount <= 0) {
-        return res.status(400).json({
-          error: "Invalid amount",
-          code: "INVALID_AMOUNT",
-        });
-      }
-
-      if (!reason || reason.trim().length < 3) {
-        return res.status(400).json({
-          error: "Adjustment reason required (minimum 3 characters)",
-          code: "REASON_REQUIRED",
-        });
-      }
-
-      // Get user's checking account
-      const { data: account, error: accountError } = await supabase
-        .from("accounts")
-        .select("id, user_id, balance, available_balance")
-        .eq("user_id", userId)
-        .eq("account_type", "checking")
-        .single();
-
-      if (accountError || !account) {
-        return res.status(404).json({
-          error: "User account not found",
-          code: "ACCOUNT_NOT_FOUND",
-        });
-      }
-
-      // Get adjustment account ID from system settings
-      const { data: adjAccountSetting } = await supabase
-        .from("system_account_ids")
-        .select("account_id")
-        .eq("key", "ADMIN_ADJUSTMENT_ACCOUNT")
-        .single();
-
-      if (!adjAccountSetting || !adjAccountSetting.account_id) {
-        return res.status(500).json({
-          error: "Adjustment account not configured",
-          code: "SYSTEM_CONFIG_ERROR",
-        });
-      }
-
-      // Prepare transaction
-      let debits = [];
-      let credits = [];
-
-      if (direction === "credit") {
-        credits.push({
-          accountId: account.id,
-          amount: amount,
-          reason: `Admin credit adjustment: ${reason}`,
-        });
-        debits.push({
-          accountId: adjAccountSetting.account_id,
-          amount: amount,
-          reason: `Admin credit to user ${userId}: ${reason}`,
-        });
-      } else {
-        debits.push({
-          accountId: account.id,
-          amount: amount,
-          reason: `Admin debit adjustment: ${reason}`,
-        });
-        credits.push({
-          accountId: adjAccountSetting.account_id,
-          amount: amount,
-          reason: `Admin debit from user ${userId}: ${reason}`,
-        });
-      }
-
-      // Execute transaction using FinancialTransactionService
-      const transactionService = new FinancialTransactionService();
-      const result = await transactionService.executeTransaction({
-        requestId: requestId,
-        userId: userId,
-        type: "ADMIN_ADJUSTMENT",
-        description: `Admin ${direction} adjustment: ${reason}`,
-        debits: debits,
-        credits: credits,
-        metadata: {
-          ip: req.ip,
-          userAgent: req.headers["user-agent"],
-          admin_id: req.user.id,
-          reason: reason,
-          adjustment_direction: direction,
-        },
-      });
-
-      // Log admin action
-      await supabase.from("admin_actions").insert({
-        admin_id: req.user.id,
-        action_type: "adjust_balance",
-        target_user_id: userId,
-        details: {
-          amount: amount,
-          direction: direction,
-          reason: reason,
-          transaction_reference: result.transactionReference,
-        },
-        ip_address: req.ip,
-        created_at: new Date().toISOString(),
-      });
-
-      // Create notification
-      await supabase.from("notifications").insert({
-        user_id: userId,
-        title: `Balance ${direction === "credit" ? "Credited" : "Debited"}`,
-        message: `Your account has been ${direction === "credit" ? "credited" : "debited"} with ₦${amount.toLocaleString()}. Reason: ${reason}`,
-        type: "info",
-        created_at: new Date().toISOString(),
-      });
-
-      res.json({
-        success: true,
-        message: `Balance ${direction}ed successfully`,
-        transaction_reference: result.transactionReference,
-        new_balance:
-          result.balances.find((b) => b.accountId === account.id)
-            ?.balanceAfter || 0,
-      });
-    } catch (error) {
-      console.error("Adjustment error:", error);
-      res.status(500).json({
-        error: "Adjustment failed",
-        code: "ADJUSTMENT_FAILED",
-        message: error.message,
-      });
-    }
-  },
-);*/
 
 app.post(
   "/api/sys/users/:userId/adjust-balance",
@@ -14416,7 +13246,8 @@ app.post(
       }
 
       // Create notification for user
-      await supabase.from("notifications").insert({
+      //await supabase.from("notifications").insert
+      await notifyAndPush({
         user_id: userId,
         title: `Upgrade Document ${document.document_type === "id" ? "ID" : "Address"} Approved`,
         message:
@@ -14511,7 +13342,8 @@ app.post(
       }
 
       // Create notification for user
-      await supabase.from("notifications").insert({
+      //await supabase.from("notifications").insert
+      await notifyAndPush({
         user_id: userId,
         title: `Upgrade Document ${document.document_type === "id" ? "ID" : "Address"} Rejected`,
         message: `Your ${document.document_type === "id" ? "ID document" : "address proof"} was rejected. Reason: ${reason}. Please resubmit with correct documents.`,
@@ -15131,7 +13963,8 @@ app.post(
 
       // Send notifications
       for (const user of uniqueUsers) {
-        await supabase.from("notifications").insert({
+        //await supabase.from("notifications").insert
+        await notifyAndPush({
           user_id: user.user_id,
           title: subject || "Savings Plan Update",
           message: message,
@@ -15758,7 +14591,8 @@ app.post(
 
       for (const user of targetUsers) {
         // Create in-app notification
-        await supabase.from("notifications").insert({
+        //await supabase.from("notifications").insert
+        await notifyAndPush({
           user_id: user.id,
           title: subject,
           message: message,
@@ -15958,163 +14792,6 @@ app.post(
   },
 );
 
-// ADMIN: Approve harvest withdrawal
-/*app.post(
-  "/api/sys/harvest-withdrawal/:requestId/approve",
-  authenticate,
-  authorizeAdmin,
-  async (req, res) => {
-    const { requestId } = req.params;
-
-    try {
-      console.log(
-        `Admin ${req.user.id} approving withdrawal request ${requestId}`,
-      );
-
-      // Get the request with all related data
-      const { data: request, error: fetchError } = await supabase
-        .from("harvest_withdrawal_requests")
-        .select(
-          `
-          *,
-          users:user_id (
-            id, 
-            email, 
-            first_name, 
-            last_name
-          ),
-          user_harvest_enrollments:enrollment_id (
-            id, 
-            total_saved,
-            user_id,
-            plan_id,
-            status
-          )
-        `,
-        )
-        .eq("id", requestId)
-        .single();
-
-      if (fetchError || !request) {
-        console.error("Request not found:", fetchError);
-        return res.status(404).json({ error: "Request not found" });
-      }
-
-      if (request.status !== "pending") {
-        return res.status(400).json({ error: "Request already processed" });
-      }
-
-      // Get user's primary account
-      const { data: account, error: accError } = await supabase
-        .from("accounts")
-        .select("*")
-        .eq("user_id", request.user_id)
-        .eq("account_type", "checking")
-        .single();
-
-      if (accError || !account) {
-        console.error("User account not found:", accError);
-        return res.status(404).json({ error: "User account not found" });
-      }
-
-      // Refund the amount to user's account
-      const newBalance = (account.balance || 0) + (request.amount || 0);
-      const newAvailable =
-        (account.available_balance || 0) + (request.amount || 0);
-
-      const { error: updateBalanceError } = await supabase
-        .from("accounts")
-        .update({
-          balance: newBalance,
-          available_balance: newAvailable,
-          updated_at: new Date().toISOString(),
-        })
-        .eq("id", account.id);
-
-      if (updateBalanceError) {
-        console.error("Balance update error:", updateBalanceError);
-        return res.status(500).json({ error: "Failed to update balance" });
-      }
-
-      // Update harvest enrollment status to "withdrawn"
-      const { error: updateEnrollmentError } = await supabase
-        .from("user_harvest_enrollments")
-        .update({
-          status: "withdrawn",
-          auto_save: false,
-          updated_at: new Date().toISOString(),
-        })
-        .eq("id", request.enrollment_id);
-
-      if (updateEnrollmentError) {
-        console.error("Enrollment update error:", updateEnrollmentError);
-      }
-
-      // Update request status
-      const { error: updateRequestError } = await supabase
-        .from("harvest_withdrawal_requests")
-        .update({
-          status: "approved",
-          processed_at: new Date().toISOString(),
-          processed_by: req.user.id,
-          admin_note: `Approved by ${req.user.email}`,
-        })
-        .eq("id", requestId);
-
-      if (updateRequestError) {
-        console.error("Request update error:", updateRequestError);
-        return res
-          .status(500)
-          .json({ error: "Failed to update request status" });
-      }
-
-      // Create refund transaction
-      const { error: transError } = await supabase.from("transactions_new").insert({
-        to_account_id: account.id,
-        to_user_id: request.user_id,
-        amount: request.amount,
-        description: "Harvest Plan Withdrawal (Admin Approved)",
-        transaction_type: "savings_withdrawal",
-        status: "completed",
-        completed_at: new Date().toISOString(),
-        is_admin_adjusted: true,
-        admin_note: `Harvest withdrawal approved by ${req.user.email}`,
-      });
-
-      if (transError) {
-        console.error("Transaction creation error:", transError);
-      }
-
-      // Send notification to user
-      await supabase.from("notifications").insert({
-        user_id: request.user_id,
-        title: "Withdrawal Request Approved ✅",
-        message: `Your Harvest Plan withdrawal of ₦${(request.amount || 0).toLocaleString()} has been approved. Funds have been returned to your account.`,
-        type: "success",
-        created_at: new Date().toISOString(),
-      });
-
-      // Log admin action
-      await supabase.from("admin_actions").insert({
-        admin_id: req.user.id,
-        action_type: "approve_harvest_withdrawal",
-        target_user_id: request.user_id,
-        details: { request_id: requestId, amount: request.amount },
-        created_at: new Date().toISOString(),
-      });
-
-      console.log(`Withdrawal ${requestId} approved successfully`);
-      res.json({
-        success: true,
-        message: "Withdrawal approved and funds returned",
-      });
-    } catch (error) {
-      console.error("Approve withdrawal error:", error);
-      res.status(500).json({ error: error.message });
-    }
-  },
-);*/
-
 // index.js - Update the harvest withdrawal approval endpoint
 app.post(
   "/api/sys/harvest-withdrawal/:requestId/approve",
@@ -16286,7 +14963,8 @@ app.post(
       });
 
       // Send notification to user
-      await supabase.from("notifications").insert({
+      //await supabase.from("notifications").insert
+      await notifyAndPush({
         user_id: request.user_id,
         title: "Harvest Plan Withdrawal Approved ✅",
         message: `Your Harvest Plan withdrawal request has been approved. ₦${refundAmount.toLocaleString()} has been returned to your account.`,
@@ -16373,7 +15051,8 @@ app.post(
       }
 
       // Send notification to user
-      await supabase.from("notifications").insert({
+      //await supabase.from("notifications").insert
+      await notifyAndPush({
         user_id: request.user_id,
         title: "Withdrawal Request Rejected ❌",
         message: `Your Harvest Plan withdrawal request was rejected. Reason: ${reason || "Not specified"}. Please continue your savings plan.`,
@@ -16659,268 +15338,6 @@ app.delete(
     }
   },
 );
-
-// ==================== ADMIN ROUTES ================
-
-// Get all external transfers (admin)
-/*app.get(
-  "/api/sys/external-transfers",
-  authenticate,
-  authorizeAdmin,
-  async (req, res) => {
-    try {
-      const { page = 1, limit = 20, status, bank } = req.query;
-      const offset = (page - 1) * limit;
-
-      let query = supabase
-        .from("external_transfers")
-        .select(
-          `
-                *,
-                users!external_transfers_user_id_fkey (
-                    id,
-                    first_name,
-                    last_name,
-                    email,
-                    phone
-                ),
-                accounts!external_transfers_from_account_id_fkey (
-                    id,
-                    account_number
-                )
-            `,
-          { count: "exact" },
-        )
-        .order("created_at", { ascending: false });
-
-      if (status && status !== "all") {
-        query = query.eq("status", status);
-      }
-
-      if (bank && bank !== "all") {
-        query = query.eq("bank_name", bank);
-      }
-
-      const {
-        data: transfers,
-        error,
-        count,
-      } = await query.range(offset, offset + limit - 1);
-
-      if (error) throw error;
-
-      // Get pending count for badge
-      const { count: pendingCount } = await supabase
-        .from("external_transfers")
-        .select("*", { count: "exact", head: true })
-        .eq("status", "pending");
-
-      res.json({
-        transfers: transfers || [],
-        pagination: {
-          page: parseInt(page),
-          limit: parseInt(limit),
-          total: count || 0,
-          pages: Math.ceil((count || 0) / limit),
-        },
-        pendingCount: pendingCount || 0,
-      });
-    } catch (error) {
-      console.error("Admin external transfers error:", error);
-      res.status(500).json({ error: "Failed to fetch external transfers" });
-    }
-  },
-);
-
-// Approve external transfer (admin)
-app.post(
-  "/api/sys/external-transfers/:id/approve",
-  authenticate,
-  authorizeAdmin,
-  async (req, res) => {
-    try {
-      const { id } = req.params;
-
-      // Get the transfer
-      const { data: transfer, error: fetchError } = await supabase
-        .from("external_transfers")
-        .select("*")
-        .eq("id", id)
-        .single();
-
-      if (fetchError || !transfer) {
-        return res.status(404).json({ error: "Transfer not found" });
-      }
-
-      if (transfer.status !== "pending") {
-        return res.status(400).json({ error: "Transfer already processed" });
-      }
-
-      // Update transfer status to completed
-      const { error: updateError } = await supabase
-        .from("external_transfers")
-        .update({
-          status: "completed",
-          processed_at: new Date().toISOString(),
-          completed_at: new Date().toISOString(),
-          processed_by: req.user.id,
-          admin_note: `Approved by ${req.user.email}`,
-        })
-        .eq("id", id);
-
-      if (updateError) throw updateError;
-
-      // Create notification for user
-      await supabase.from("notifications").insert({
-        user_id: transfer.user_id,
-        title: "External Transfer Approved ✅",
-        message: `Your transfer of $${transfer.amount} to ${transfer.bank_name} has been approved and is being processed. Funds will arrive within 2-3 business days.`,
-        type: "success",
-        created_at: new Date().toISOString(),
-      });
-
-      res.json({
-        success: true,
-        message: "External transfer approved successfully",
-      });
-    } catch (error) {
-      console.error("Approve external transfer error:", error);
-      res.status(500).json({ error: "Failed to approve transfer" });
-    }
-  },
-);
-
-// Reject external transfer (admin) - REFUNDS THE USER
-app.post(
-  "/api/sys/external-transfers/:id/reject",
-  authenticate,
-  authorizeAdmin,
-  async (req, res) => {
-    try {
-      const { id } = req.params;
-      const { reason } = req.body;
-
-      // Get the transfer
-      const { data: transfer, error: fetchError } = await supabase
-        .from("external_transfers")
-        .select("*")
-        .eq("id", id)
-        .single();
-
-      if (fetchError || !transfer) {
-        return res.status(404).json({ error: "Transfer not found" });
-      }
-
-      if (transfer.status !== "pending") {
-        return res.status(400).json({ error: "Transfer already processed" });
-      }
-
-      // REFUND THE USER - Add money back to their account
-      const { data: account, error: accountError } = await supabase
-        .from("accounts")
-        .select("*")
-        .eq("id", transfer.from_account_id)
-        .single();
-
-      if (!accountError && account) {
-        await supabase
-          .from("accounts")
-          .update({
-            balance: account.balance + transfer.amount,
-            available_balance: account.available_balance + transfer.amount,
-            updated_at: new Date().toISOString(),
-          })
-          .eq("id", transfer.from_account_id);
-
-        // Create refund transaction record
-        await supabase.from("transactions_new").insert({
-          receiver_account_id: transfer.from_account_id,
-          receiver_user_id: transfer.user_id,
-          amount: transfer.amount,
-          description: `Refund: External transfer to ${transfer.bank_name} was rejected. Reason: ${reason || "Not specified"}`,
-          transaction_type: "refund",
-          status: "completed",
-          completed_at: new Date().toISOString(),
-          metadata: {
-            is_admin_adjusted: true,
-            admin_note: `Rejected by ${req.user.email}. Refunded.`,
-          },
-        });
-      }
-
-      // Update transfer status to rejected
-      const { error: updateError } = await supabase
-        .from("external_transfers")
-        .update({
-          status: "rejected",
-          processed_at: new Date().toISOString(),
-          processed_by: req.user.id,
-          admin_note: reason || `Rejected by ${req.user.email}`,
-        })
-        .eq("id", id);
-
-      if (updateError) throw updateError;
-
-      // Create notification for user about rejection and refund
-      await supabase.from("notifications").insert({
-        user_id: transfer.user_id,
-        title: "External Transfer Rejected ❌",
-        message: `Your transfer of $${transfer.amount} to ${transfer.bank_name} was rejected. Reason: ${reason || "Not specified"}. Funds have been refunded to your account.`,
-        type: "error",
-        created_at: new Date().toISOString(),
-      });
-
-      res.json({
-        success: true,
-        message: "External transfer rejected and funds refunded",
-      });
-    } catch (error) {
-      console.error("Reject external transfer error:", error);
-      res.status(500).json({ error: "Failed to reject transfer" });
-    }
-  },
-);
-
-// Get external transfer stats for admin dashboard
-app.get(
-  "/api/sys/external-transfers/stats",
-  authenticate,
-  authorizeAdmin,
-  async (req, res) => {
-    try {
-      // Get counts by status
-      const { data: statusCounts } = await supabase
-        .from("external_transfers")
-        .select("status, count")
-        .select("status", { count: "exact", head: false });
-
-      // Get total volume
-      const { data: volumeData } = await supabase
-        .from("external_transfers")
-        .select("amount")
-        .eq("status", "completed");
-
-      const totalVolume =
-        volumeData?.reduce((sum, t) => sum + t.amount, 0) || 0;
-
-      // Get pending count
-      const { count: pendingCount } = await supabase
-        .from("external_transfers")
-        .select("*", { count: "exact", head: true })
-        .eq("status", "pending");
-
-      res.json({
-        pending: pendingCount || 0,
-        completed: volumeData?.length || 0,
-        totalVolume: totalVolume,
-        averageAmount: volumeData?.length ? totalVolume / volumeData.length : 0,
-      });
-    } catch (error) {
-      console.error("Error fetching external transfer stats:", error);
-      res.status(500).json({ error: "Failed to fetch stats" });
-    }
-  },
-);*/
 
 // ============================================================
 // GET FLUTTERWAVE BANKS
@@ -18291,7 +16708,8 @@ app.post(
       await bumpUserCacheVersion("authuser", userId);
 
       // Create notification for user
-      await supabase.from("notifications").insert({
+      //await supabase.from("notifications").insert
+      await notifyAndPush({
         user_id: userId,
         title: freeze ? "Account Frozen" : "Account Unfrozen",
         message: freeze
@@ -18340,7 +16758,8 @@ app.post(
         .eq("id", userId);
 
       // Create notification
-      await supabase.from("notifications").insert({
+      //await supabase.from("notifications").insert
+      await notifyAndPush({
         user_id: userId,
         title: "KYC Update",
         message: `Your KYC verification status is now: ${status}`,
@@ -19403,7 +17822,8 @@ app.put(
       }
 
       if (updates.is_frozen !== undefined) {
-        await supabase.from("notifications").insert({
+        //await supabase.from("notifications").insert
+        await notifyAndPush({
           user_id: userId,
           title: updates.is_frozen ? "Account Frozen" : "Account Unfrozen",
           message: updates.is_frozen
@@ -19463,11 +17883,12 @@ app.post(
         .eq("id", userId);
 
       // Create notification
-      await supabase.from("notifications").insert({
+      //await supabase.from("notifications").insert
+      await notifyAndPush({
         user_id: userId,
         title: "Password Reset",
         message:
-          "Your password has been reset by an administrator. Please check your email for the new temporary password.",
+          "Your password has been reset by our team. Please check your email for the new temporary password.",
         type: "warning",
       });
 
@@ -19561,7 +17982,7 @@ app.post(
       await supabase.from("notifications").insert({
         user_id: card.user_id,
         title: `Card ${action}d`,
-        message: `Your card ending in ${card.card_number.slice(-4)} has been ${action}d by an administrator.`,
+        message: `Your card ending in ${card.card_number.slice(-4)} has been ${action}d by an our team.`,
         type: "warning",
       });
 

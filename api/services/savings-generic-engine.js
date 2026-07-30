@@ -23,6 +23,8 @@ const {
 } = require("./savings-cron");
 const catalog = require("./savings-catalog-service");
 
+const { notifyAndPush } = require("../../lib/notification-service");
+
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_KEY,
@@ -325,7 +327,8 @@ async function processSingleDeduction(enrollment) {
       updates.next_free_withdrawal_date = freeDate.toISOString().slice(0, 10);
     }
 
-    await supabase.from("notifications").insert({
+    //await supabase.from("notifications").insert
+    await notifyAndPush({
       user_id: enrollment.user_id,
       title: "Savings Goal Reached",
       message: `Your ${enrollment.savings_products?.name || "savings"} plan is complete!`,

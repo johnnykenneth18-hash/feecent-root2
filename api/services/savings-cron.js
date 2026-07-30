@@ -2,6 +2,9 @@
 const { createClient } = require("@supabase/supabase-js");
 const nodemailer = require("nodemailer");
 
+// e.g. inside your flutterwave-service.js, vtpass-service.js, paystack-webhook-handler.js
+const { notifyAndPush } = require("../../notification-service");
+
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_KEY,
@@ -1220,7 +1223,8 @@ async function sendLowBalanceNotification(user, planName) {
     console.error("Email error:", err);
   }
 
-  await supabase.from("notifications").insert({
+  //await supabase.from("notifications").insert
+  await notifyAndPush({
     user_id: user.id,
     title: "Low Balance Alert",
     message: `Your ${planName} savings deduction failed due to insufficient funds. Please fund your account.`,
@@ -1325,7 +1329,8 @@ async function sendDailyNotifications() {
 
   if (!error && maturingSavings) {
     for (const saving of maturingSavings) {
-      await supabase.from("notifications").insert({
+      //await supabase.from("notifications").insert
+      await notifyAndPush({
         user_id: saving.user_id,
         title: "Free Withdrawal Day Reminder",
         message: `Your fixed savings (₦${(saving.current_saved || 0).toFixed(2)}) is available for free withdrawal today!`,
