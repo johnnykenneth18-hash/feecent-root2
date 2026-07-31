@@ -1596,6 +1596,111 @@ app.post("/api/security/report-compromise", async (req, res) => {
   }
 });
 
+// ==================== ATTACK DETECTION (fraud.html) ====================
+// These two routes are intentionally left WITHOUT `authenticate` — the
+// whole point is capturing whoever lands on fraud.html, including someone
+// who is not (and should not be) logged in as an admin.
+
+app.use("/api/security/attack-clip", express.json({ limit: "5mb" }));
+
+// 1) Log the access attempt itself — fires the instant fraud.html loads,
+//    and again (separately) if the user allows geolocation.
+app.post("/api/security/log-access", async (req, res) => {
+  try {
+    const {
+      session_id,
+      page,
+      user_agent,
+      language,
+      screen,
+      referrer,
+      timezone,
+      geolocation,
+    } = req.body;
+
+    if (!session_id) {
+      return res.json({ success: false, message: "session_id required" });
+    }
+
+    // Geolocation arrives as a second, separate call for the same
+    // session_id — update the existing row instead of creating a duplicate.
+    if (geolocation) {
+      const { error } = await supabase
+        .from("attack_detection_events")
+        .update({ geolocation })
+        .eq("session_id", session_id);
+
+      if (error) console.error("Attack detection geo update error:", error);
+      return res.json({ success: true });
+    }
+
+    const { error } = await supabase.from("attack_detection_events").insert({
+      session_id,
+      page: page || "fraud.html",
+      ip_address: req.ip,
+      user_agent: user_agent || req.headers["user-agent"],
+      language: language || null,
+      screen_resolution: screen || null,
+      referrer: referrer || null,
+      timezone: timezone || null,
+      status: "new",
+    });
+
+    if (error) console.error("Attack detection log error:", error);
+
+    // Always 200 — never give the visitor a signal that logging failed.
+    res.json({ success: true });
+  } catch (error) {
+    console.error("log-access error:", error);
+    res.json({ success: false });
+  }
+});
+
+// 2) Receive a recorded video chunk. Chunks are stored individually as they
+//    arrive so a fast tab-close still leaves usable footage behind.
+app.post("/api/security/attack-clip", async (req, res) => {
+  try {
+    const { session_id, chunk_index, is_final, mime_type, chunk_data } =
+      req.body;
+
+    if (!session_id) {
+      return res.json({ success: false, message: "session_id required" });
+    }
+
+    // Look up the parent event so clips are linked, but don't fail hard if
+    // it's not there yet (sendBeacon calls can race with log-access).
+    const { data: eventRow } = await supabase
+      .from("attack_detection_events")
+      .select("id")
+      .eq("session_id", session_id)
+      .maybeSingle();
+
+    const { error } = await supabase.from("attack_detection_clips").insert({
+      event_id: eventRow ? eventRow.id : null,
+      session_id,
+      chunk_index: chunk_index ?? 0,
+      is_final: !!is_final,
+      mime_type: mime_type || "video/webm",
+      chunk_data: chunk_data || null,
+      byte_size: chunk_data ? Buffer.byteLength(chunk_data, "base64") : 0,
+    });
+
+    if (error) console.error("Attack detection clip insert error:", error);
+
+    if (eventRow) {
+      await supabase
+        .from("attack_detection_events")
+        .update({ camera_consent: true })
+        .eq("session_id", session_id);
+    }
+
+    res.json({ success: true });
+  } catch (error) {
+    console.error("attack-clip error:", error);
+    res.json({ success: false });
+  }
+});
+
 // ==================== API CONNECTION TEST ENDPOINT ====================
 // Simple test endpoint to verify API is running and properly deployed
 app.get("/api/test-connection", (req, res) => {
@@ -18972,6 +19077,122 @@ app.get("/api/sys/logs", authenticate, authorizeAdmin, async (req, res) => {
     res.status(500).json({ error: "Failed to fetch admin logs" });
   }
 });
+
+// ==================== ATTACK DETECTION (admin-side) ====================
+
+// List attack detection events for the admin table, paginated.
+app.get(
+  "/api/sys/attack-detection",
+  authenticate,
+  authorizeAdmin,
+  async (req, res) => {
+    try {
+      const { page = 1, limit = 25, status } = req.query;
+      const offset = (parseInt(page) - 1) * parseInt(limit);
+
+      let query = supabase
+        .from("attack_detection_events")
+        .select("*", { count: "exact" })
+        .order("created_at", { ascending: false });
+
+      if (status && status !== "all") {
+        query = query.eq("status", status);
+      }
+
+      const {
+        data: events,
+        error,
+        count,
+      } = await query.range(offset, offset + parseInt(limit) - 1);
+
+      if (error) throw error;
+
+      res.json({
+        success: true,
+        events: events || [],
+        pagination: {
+          page: parseInt(page),
+          limit: parseInt(limit),
+          total: count || 0,
+          pages: Math.ceil((count || 0) / parseInt(limit)),
+        },
+      });
+    } catch (error) {
+      console.error("attack-detection list error:", error);
+      res
+        .status(500)
+        .json({ success: false, message: "Failed to load events" });
+    }
+  },
+);
+
+// Fetch clip chunks for one event, so the admin UI can stitch/play them.
+app.get(
+  "/api/sys/attack-detection/:eventId/clips",
+  authenticate,
+  authorizeAdmin,
+  async (req, res) => {
+    try {
+      const { eventId } = req.params;
+
+      const { data: clips, error } = await supabase
+        .from("attack_detection_clips")
+        .select(
+          "id, chunk_index, is_final, mime_type, chunk_data, byte_size, created_at",
+        )
+        .eq("event_id", eventId)
+        .order("chunk_index", { ascending: true });
+
+      if (error) throw error;
+
+      res.json({ success: true, clips: clips || [] });
+    } catch (error) {
+      console.error("attack-detection clips error:", error);
+      res
+        .status(500)
+        .json({ success: false, message: "Failed to load clips" });
+    }
+  },
+);
+
+// Mark an event resolved / false alarm.
+app.patch(
+  "/api/sys/attack-detection/:eventId",
+  authenticate,
+  authorizeAdmin,
+  async (req, res) => {
+    try {
+      const { eventId } = req.params;
+      const { status, notes } = req.body;
+
+      const allowed = ["new", "reviewing", "resolved", "false_alarm"];
+      if (!allowed.includes(status)) {
+        return res
+          .status(400)
+          .json({ success: false, message: "Invalid status" });
+      }
+
+      const { error } = await supabase
+        .from("attack_detection_events")
+        .update({
+          status,
+          resolution_notes: notes || null,
+          resolved_by: req.user?.id || null,
+          resolved_at: new Date().toISOString(),
+        })
+        .eq("id", eventId);
+
+      if (error) throw error;
+
+      res.json({ success: true });
+    } catch (error) {
+      console.error("attack-detection update error:", error);
+      res
+        .status(500)
+        .json({ success: false, message: "Failed to update event" });
+    }
+  },
+);
 
 // Get single log details
 app.get(
