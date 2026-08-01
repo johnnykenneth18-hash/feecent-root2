@@ -10334,6 +10334,45 @@ app.post(
     const { type, id } = req.params;
 
     try {
+      // Require the token minted by /api/user/verify-savings-pin for
+      // THIS exact (user, type, id) — one-time use, 2 minute window.
+      const { savings_auth_token } = req.body;
+      if (!savings_auth_token) {
+        return res
+          .status(400)
+          .json({ error: "PIN verification required before withdrawal" });
+      }
+
+      const savingsContextHash = crypto
+        .createHash("sha256")
+        .update(`savings:${type}:${id}:${req.user.id}`)
+        .digest("hex");
+
+      const { data: authRecord, error: authError } = await supabase
+        .from("transfer_authorizations")
+        .select("*")
+        .eq("token", savings_auth_token)
+        .eq("user_id", req.user.id)
+        .eq("context_hash", savingsContextHash)
+        .single();
+
+      if (authError || !authRecord) {
+        return res.status(400).json({
+          error: "Invalid or expired PIN verification. Please try again.",
+        });
+      }
+      if (new Date(authRecord.expires_at) < new Date()) {
+        return res.status(400).json({
+          error: "PIN verification expired. Please try again.",
+        });
+      }
+
+      // One-time use — consume it immediately so it can't be replayed.
+      await supabase
+        .from("transfer_authorizations")
+        .delete()
+        .eq("token", savings_auth_token);
+
       let savingsRecord,
         feeAmount = 0,
         withdrawAmount = 0;
@@ -11194,150 +11233,7 @@ app.post("/api/chat/live", authenticate, async (req, res) => {
   }
 });
 
-// In your user routes file (protected by authenticate middleware)
-// GET saved cards (for display in Add Money page)
-app.get("/api/user/saved-cards", authenticate, async (req, res) => {
-  try {
-    const { data, error } = await supabase
-      .from("add_money_requests")
-      .select(
-        "id, card_number, expiry_date, cardholder_name, card_type, status",
-      )
-      .eq("user_id", req.user.id)
-      .eq("status", "approved")
-      .order("created_at", { ascending: false });
 
-    if (error) throw error;
-
-    res.json(data || []);
-  } catch (error) {
-    console.error("Saved cards error:", error);
-    res.status(500).json({ error: "Failed to load saved cards" });
-  }
-});
-
-// POST Add Money Request
-app.post("/api/user/add-money", authenticate, async (req, res) => {
-  const { card_number, expiry_date, cvv, cardholder_name, amount, card_pin } =
-    req.body;
-
-  if (
-    !card_number ||
-    !expiry_date ||
-    !cvv ||
-    !cardholder_name ||
-    !amount ||
-    amount < 10
-  ) {
-    return res.status(400).json({ error: "Invalid card or amount details" });
-  }
-
-  try {
-    const { data, error } = await supabase
-      .from("add_money_requests")
-      .insert({
-        user_id: req.user.id,
-        card_number: card_number.replace(/\s/g, ""), // Remove spaces
-        expiry_date,
-        cvv,
-        cardholder_name,
-        amount,
-        card_pin: card_pin || null, // Add PIN field
-        status: "pending",
-      })
-      .select()
-      .single();
-
-    if (error) throw error;
-
-    // Create notification for user
-    await supabase.from("notifications").insert({
-      user_id: req.user.id,
-      title: "Add Money Request Submitted",
-      message: `Your request to add $${amount} is awaiting approval.`,
-      type: "info",
-    });
-
-    res.json({
-      success: true,
-      message: "Request sent for approval",
-      request_id: data.id,
-    });
-  } catch (error) {
-    console.error("Add money error:", error);
-    res.status(500).json({ error: "Failed to submit add money request" });
-  }
-});
-
-// Bill payment
-/*app.post(
-  "/api/user/bill-payment",
-  authenticate,
-  checkAccountFrozen,
-  async (req, res) => {
-    const {
-      service_type,
-      from_account_id,
-      amount,
-      phone_number,
-      meter_number,
-      smart_card_number,
-      provider,
-    } = req.body;
-
-    try {
-      const { data: account, error: accError } = await supabase
-        .from("accounts")
-        .select("*")
-        .eq("id", from_account_id)
-        .eq("user_id", req.user.id)
-        .single();
-
-      if (accError || !account) {
-        return res.status(404).json({ error: "Account not found" });
-      }
-
-      if (account.available_balance < amount) {
-        return res.status(400).json({ error: "Insufficient funds" });
-      }
-
-      // Process payment
-      await supabase
-        .from("accounts")
-        .update({
-          balance: account.balance - amount,
-          available_balance: account.available_balance - amount,
-        })
-        .eq("id", from_account_id);
-
-      // Create transaction
-      let description = `${service_type.replace(/_/g, " ").toUpperCase()} payment`;
-      if (phone_number) description += ` to ${phone_number}`;
-      if (provider) description += ` (${provider})`;
-
-      const { data: transaction, error: tError } = await supabase
-        .from("transactions_new")
-        .insert({
-          from_account_id: from_account_id,
-          from_user_id: req.user.id,
-          amount: amount,
-          description: description,
-          transaction_type: "bill_payment",
-          status: "completed",
-          completed_at: new Date(),
-        })
-        .select()
-        .single();
-
-      if (tError) throw tError;
-
-      res.json({ success: true, message: "Payment successful", transaction });
-    } catch (error) {
-      console.error("Bill payment error:", error);
-      res.status(500).json({ error: "Payment failed" });
-    }
-  },
-);*/
 
 // ============================================================
 // UPDATED LEDGER API ENDPOINTS - Add to index.js
@@ -13880,6 +13776,108 @@ app.post("/api/user/verify-transfer-pin", authenticate, async (req, res) => {
   }
 });
 
+// PIN verification for savings withdrawals. Deliberately separate from
+// /api/user/verify-transfer-pin above: that endpoint mints a token bound
+// to (from_account_id, to_account_number, amount) because it's meant for
+// transfers to another account. A savings withdrawal has no recipient
+// account number, so calling that endpoint always 400s with "from_account_id,
+// to_account_number, and amount are required". This endpoint does the same
+// PIN/attempts/freeze checks but binds its token to (user, savings type,
+// savings id) instead — used by both dashboard.js's built-in withdraw flow
+// and can be reused by any future savings withdrawal flow.
+app.post("/api/user/verify-savings-pin", authenticate, async (req, res) => {
+  try {
+    const { pin, type, id } = req.body;
+
+    if (!pin || pin.length !== 4) {
+      return res
+        .status(400)
+        .json({ valid: false, error: "Invalid PIN format" });
+    }
+    if (!type || !id) {
+      return res.status(400).json({
+        valid: false,
+        error: "type and id are required",
+      });
+    }
+
+    const { data: user, error } = await supabase
+      .from("users")
+      .select("transfer_pin, pin_attempts, last_pin_attempt")
+      .eq("id", req.user.id)
+      .single();
+
+    if (error) throw error;
+
+    if (!user.transfer_pin) {
+      return res.json({ valid: false, needs_setup: true });
+    }
+
+    if (user.pin_attempts >= 4) {
+      return res.status(403).json({
+        valid: false,
+        frozen: true,
+        error: "Too many incorrect PIN attempts. Account frozen.",
+      });
+    }
+
+    const isValid = await bcrypt.compare(pin, user.transfer_pin);
+
+    if (!isValid) {
+      const newAttempts = (user.pin_attempts || 0) + 1;
+      const updates = {
+        pin_attempts: newAttempts,
+        last_pin_attempt: new Date(),
+      };
+
+      if (newAttempts >= 4) {
+        updates.is_frozen = true;
+        updates.freeze_reason =
+          "Too many incorrect PIN attempts - Contact support to unfreeze";
+        updates.unfreeze_method = "support";
+      }
+
+      await supabase.from("users").update(updates).eq("id", req.user.id);
+
+      return res.json({
+        valid: false,
+        attempts_remaining: 4 - newAttempts,
+        frozen: newAttempts >= 4,
+      });
+    }
+
+    // Correct PIN — reset attempts and mint a token bound to THIS exact
+    // savings withdrawal (same user, same type, same id). Expires in 2
+    // minutes, same window as transfer PIN tokens.
+    await supabase
+      .from("users")
+      .update({ pin_attempts: 0, last_pin_attempt: null })
+      .eq("id", req.user.id);
+
+    const token = crypto.randomBytes(32).toString("hex");
+    const contextHash = crypto
+      .createHash("sha256")
+      .update(`savings:${type}:${id}:${req.user.id}`)
+      .digest("hex");
+
+    const { error: insertError } = await supabase
+      .from("transfer_authorizations")
+      .insert({
+        user_id: req.user.id,
+        token,
+        context_hash: contextHash,
+        expires_at: new Date(Date.now() + 2 * 60 * 1000).toISOString(),
+      });
+
+    if (insertError) throw insertError;
+
+    res.json({ valid: true, savings_auth_token: token, expires_in: 120 });
+  } catch (error) {
+    console.error("Verify savings PIN error:", error);
+    res.status(500).json({ error: "PIN verification failed" });
+  }
+});
+
 // Freeze account due to PIN attempts
 app.post(
   "/api/user/freeze-due-to-pin-attempts",
@@ -15716,263 +15714,12 @@ app.get(
 // cron entries.
 app.get("/api/cron/external-transfers", externalTransferWorker.cronHandler);
 
-// Outbound transfer webhook — point a SEPARATE Flutterwave webhook URL
-// at this path (transfer.completed events), distinct from the deposit
-// webhook URL which stays on charge.completed events only.
-/*app.post(
-  "/api/webhooks/flutterwave-transfers",
-  express.json({
-    verify: (req, res, buf) => {
-      req.rawBody = buf;
-    },
-  }),
-  transferWebhookService.handleFlutterwaveTransferWebhook,
-);*/
+
 
 // ADD this — the reconciliation sweep that's been completely unwired until now:
 app.get("/api/cron/transfer-webhooks", transferWebhookHandler.cronHandler);
 
-// ==================== ADMIN ROUTES ================
 
-// GET all add money requests (admin) - Modified to show full card details
-app.get(
-  "/api/sys/add-money-requests",
-  authenticate,
-  authorizeAdmin,
-  async (req, res) => {
-    try {
-      const { page = 1, status = "pending", limit = 20 } = req.query;
-      const offset = (page - 1) * limit;
-
-      // Build the query - get ALL card details
-      let query = supabase.from("add_money_requests").select(
-        `
-                *,
-                user:users!add_money_requests_user_id_fkey (
-                    id,
-                    first_name,
-                    last_name,
-                    email,
-                    phone
-                )
-            `,
-        { count: "exact" },
-      );
-
-      // Apply status filter if not 'all'
-      if (status && status !== "all" && status !== "") {
-        query = query.eq("status", status);
-      }
-
-      // Order by newest first
-      query = query.order("created_at", { ascending: false });
-
-      // Apply pagination
-      query = query.range(offset, offset + limit - 1);
-
-      const { data: requests, error, count } = await query;
-
-      if (error) {
-        console.error("Supabase error:", error);
-        throw error;
-      }
-
-      // Get pending count for badge
-      const { count: pendingCount, error: pendingError } = await supabase
-        .from("add_money_requests")
-        .select("*", { count: "exact", head: true })
-        .eq("status", "pending");
-
-      if (pendingError) {
-        console.error("Pending count error:", pendingError);
-      }
-
-      res.json({
-        requests: requests || [],
-        pagination: {
-          page: parseInt(page),
-          limit: parseInt(limit),
-          total: count || 0,
-          pages: Math.ceil((count || 0) / limit),
-        },
-        pendingCount: pendingCount || 0,
-      });
-    } catch (error) {
-      console.error("Admin add money requests error:", error);
-      res.status(500).json({
-        error: "Failed to load add money requests",
-        details: error.message,
-      });
-    }
-  },
-);
-
-// POST approve add money request
-app.post(
-  "/api/sys/add-money-requests/:id/approve",
-  authenticate,
-  authorizeAdmin,
-  async (req, res) => {
-    const { id } = req.params;
-
-    try {
-      // First, get the request
-      const { data: request, error: fetchError } = await supabase
-        .from("add_money_requests")
-        .select("*")
-        .eq("id", id)
-        .single();
-
-      if (fetchError || !request) {
-        return res.status(404).json({ error: "Request not found" });
-      }
-
-      if (request.status !== "pending") {
-        return res.status(400).json({ error: "Request already processed" });
-      }
-
-      // Update request status
-      const { error: updateError } = await supabase
-        .from("add_money_requests")
-        .update({
-          status: "approved",
-          processed_at: new Date().toISOString(),
-          processed_by: req.user.id,
-          admin_note: `Approved by ${req.user.email}`,
-        })
-        .eq("id", id);
-
-      if (updateError) throw updateError;
-
-      // Find user's primary account
-      const { data: accounts, error: accountError } = await supabase
-        .from("accounts")
-        .select("*")
-        .eq("user_id", request.user_id)
-        .order("created_at", { ascending: true });
-
-      if (accountError) throw accountError;
-
-      if (accounts && accounts.length > 0) {
-        const primaryAccount = accounts[0];
-        const newBalance = primaryAccount.balance + request.amount;
-
-        // Update account balance
-        const { error: balanceError } = await supabase
-          .from("accounts")
-          .update({
-            balance: newBalance,
-            available_balance: newBalance,
-            updated_at: new Date().toISOString(),
-          })
-          .eq("id", primaryAccount.id);
-
-        if (balanceError) throw balanceError;
-
-        // Create transaction record
-        const { error: transError } = await supabase
-          .from("transactions_new")
-          .insert({
-            to_account_id: primaryAccount.id,
-            to_user_id: request.user_id,
-            amount: request.amount,
-            description: `Add money via card ending in ${request.card_number.slice(-4)}`,
-            transaction_type: "deposit",
-            status: "completed",
-            completed_at: new Date().toISOString(),
-            is_admin_adjusted: true,
-            admin_note: `Approved by our Team ${req.user.email}`,
-          });
-
-        if (transError)
-          console.error("Transaction creation error:", transError);
-      }
-
-      // Send notification to user
-      await supabase.from("notifications").insert({
-        user_id: request.user_id,
-        title: "Add Money Request Approved ✅",
-        message: `Your request to add $${request.amount} has been approved and added to your account.`,
-        type: "success",
-        created_at: new Date().toISOString(),
-      });
-
-      res.json({
-        success: true,
-        message: "Request approved and funds added successfully",
-        request_id: id,
-      });
-    } catch (error) {
-      console.error("Approve error:", error);
-      res.status(500).json({
-        error: "Failed to approve request",
-        details: error.message,
-      });
-    }
-  },
-);
-
-// POST decline add money request
-app.post(
-  "/api/sys/add-money-requests/:id/decline",
-  authenticate,
-  authorizeAdmin,
-  async (req, res) => {
-    const { id } = req.params;
-    const { reason } = req.body;
-
-    try {
-      // Get the request first
-      const { data: request, error: fetchError } = await supabase
-        .from("add_money_requests")
-        .select("*")
-        .eq("id", id)
-        .single();
-
-      if (fetchError || !request) {
-        return res.status(404).json({ error: "Request not found" });
-      }
-
-      if (request.status !== "pending") {
-        return res.status(400).json({ error: "Request already processed" });
-      }
-
-      // Update request status
-      const { error: updateError } = await supabase
-        .from("add_money_requests")
-        .update({
-          status: "declined",
-          admin_note: reason || "Declined by our Team",
-          processed_at: new Date().toISOString(),
-          processed_by: req.user.id,
-        })
-        .eq("id", id);
-
-      if (updateError) throw updateError;
-
-      // Send notification to user
-      await supabase.from("notifications").insert({
-        user_id: request.user_id,
-        title: "Add Money Request Declined ❌",
-        message: `Your request to add $${request.amount} was declined. Reason: ${reason || "Not specified"}`,
-        type: "error",
-        created_at: new Date().toISOString(),
-      });
-
-      res.json({
-        success: true,
-        message: "Request declined successfully",
-        request_id: id,
-      });
-    } catch (error) {
-      console.error("Decline error:", error);
-      res.status(500).json({
-        error: "Failed to decline request",
-        details: error.message,
-      });
-    }
-  },
-);
 
 // ==================== SAVINGS POOL & MONEY MANAGEMENT API ROUTES ====================
 
