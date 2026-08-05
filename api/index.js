@@ -47,6 +47,7 @@ function ledgerEntryDelta(entry) {
   return 0;
 }
 const axios = require("axios");
+const { validate, schemas } = require("../lib/validation");
 
 // ONLY NOW declare app
 const app = express();
@@ -80,6 +81,56 @@ const transferLimiter = rateLimit({
   windowMs: 60 * 60 * 1000,
   max: 20,
   message: { error: "Transfer limit reached. Try again later." },
+});
+
+// SECURITY FIX (Critical): dedicated limiter for PIN / staff-ID verification
+// endpoints. These already have a DB-persisted 4-attempt account freeze,
+// but that only throttles a single account. Without a request-level limiter
+// an attacker holding a valid session token (or a leaked/stolen one) could
+// still fire many rapid guesses per minute, or spray requests across many
+// accounts to fish for weak PINs (e.g. 0000/1234) before any single account
+// hits its freeze threshold. keyGenerator combines IP + authenticated user
+// so it can't be trivially bypassed by rotating IPs against one account.
+const pinVerifyLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 8,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many PIN attempts. Please try again later." },
+  keyGenerator: (req) => `${req.ip}:${req.user?.id || "anon"}`,
+});
+
+// SECURITY FIX (Critical): registration and staff-ID verification had no
+// rate limiting at all, making them viable brute-force / enumeration and
+// account-takeover targets.
+const registerLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many registration attempts. Try again later." },
+});
+
+const staffIdLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 8,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many staff ID attempts. Please try again later." },
+  keyGenerator: (req) => `${req.ip}:${req.body?.userId || "anon"}`,
+});
+
+// SECURITY FIX (High): password-reset OTP requests had no rate limiting,
+// letting an attacker spam OTP generation (email/SMS cost abuse) or bombard
+// a victim's inbox. Keyed by IP + email so it can't be sidestepped by just
+// rotating the target email from one IP.
+const otpRequestLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 5,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many password reset requests. Try again later." },
+  keyGenerator: (req) => `${req.ip}:${(req.body?.email || "").toLowerCase()}`,
 });
 
 // Enhanced security headers
@@ -1737,7 +1788,7 @@ app.post("/api/test-connection", (req, res) => {
 
 // ==================== AUTHENTICATION ROUTES ====================
 
-app.post("/api/auth/register", async (req, res) => {
+app.post("/api/auth/register", registerLimiter, validate(schemas.register), async (req, res) => {
   try {
     const {
       email,
@@ -2260,7 +2311,7 @@ app.post("/api/auth/register", async (req, res) => {
 
 // In index.js - REPLACE the login endpoint with this stricter version
 
-app.post("/api/auth/login", authLimiter, async (req, res) => {
+app.post("/api/auth/login", authLimiter, validate(schemas.login), async (req, res) => {
   try {
     const { email, password, fingerprint } = req.body;
     const ip = req.ip;
@@ -2322,7 +2373,7 @@ app.post("/api/auth/login", authLimiter, async (req, res) => {
     // ========== CHECK IF 2FA IS ENABLED ==========
     if (user.two_factor_enabled) {
       // Generate OTP
-      const otpCode = Math.floor(100000 + Math.random() * 900000).toString();
+      const otpCode = crypto.randomInt(100000, 1000000).toString(); // SECURITY FIX: cryptographically secure OTP
       const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
 
       // Store OTP with user_id
@@ -2571,7 +2622,7 @@ app.get("/api/user/2fa/status", authenticate, async (req, res) => {
 // Send setup OTP
 app.post("/api/user/2fa/send-setup-otp", authenticate, async (req, res) => {
   try {
-    const otpCode = Math.floor(100000 + Math.random() * 900000).toString();
+    const otpCode = crypto.randomInt(100000, 1000000).toString(); // SECURITY FIX: cryptographically secure OTP
     const requestId = uuidv4();
     const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
 
@@ -2601,7 +2652,7 @@ app.post("/api/user/2fa/resend-setup-otp", authenticate, async (req, res) => {
     // Mark old OTP as used
     await supabase.from("otps").update({ is_used: true }).eq("id", request_id);
 
-    const otpCode = Math.floor(100000 + Math.random() * 900000).toString();
+    const otpCode = crypto.randomInt(100000, 1000000).toString(); // SECURITY FIX: cryptographically secure OTP
     const newRequestId = uuidv4();
     const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
 
@@ -2943,7 +2994,7 @@ app.post("/api/auth/resend-2fa-otp", async (req, res) => {
       .eq("is_used", false);
 
     // Generate new OTP
-    const otpCode = Math.floor(100000 + Math.random() * 900000).toString();
+    const otpCode = crypto.randomInt(100000, 1000000).toString(); // SECURITY FIX: cryptographically secure OTP
     const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
 
     await supabase.from("otps").insert({
@@ -4526,7 +4577,7 @@ app.post("/api/auth/resend-otp", async (req, res) => {
     }
 
     // Generate new OTP
-    const otpCode = Math.floor(100000 + Math.random() * 900000).toString();
+    const otpCode = crypto.randomInt(100000, 1000000).toString(); // SECURITY FIX: cryptographically secure OTP
     const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
 
     // Delete old OTPs
@@ -4677,7 +4728,7 @@ app.post("/api/user/send-passcode-otp", authenticate, async (req, res) => {
     if (error) throw error;
 
     // Generate OTP
-    const otpCode = Math.floor(100000 + Math.random() * 900000).toString();
+    const otpCode = crypto.randomInt(100000, 1000000).toString(); // SECURITY FIX: cryptographically secure OTP
     const expiresAt = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes
     const requestId = uuidv4();
 
@@ -4778,7 +4829,7 @@ app.post("/api/user/resend-passcode-otp", authenticate, async (req, res) => {
     if (error) throw error;
 
     // Generate new OTP
-    const otpCode = Math.floor(100000 + Math.random() * 900000).toString();
+    const otpCode = crypto.randomInt(100000, 1000000).toString(); // SECURITY FIX: cryptographically secure OTP
     const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
     const newRequestId = uuidv4();
 
@@ -5159,7 +5210,7 @@ async function checkTierTransferLimit(userId, amount) {
 
 // ==================== FORGOT PASSWORD ROUTES (EMAIL ONLY) ====================
 
-app.post("/api/auth/forgot-password", async (req, res) => {
+app.post("/api/auth/forgot-password", otpRequestLimiter, async (req, res) => {
   const { email } = req.body;
 
   if (!email) {
@@ -5189,10 +5240,17 @@ app.post("/api/auth/forgot-password", async (req, res) => {
     }
 
     // STEP 2: User exists - generate OTP
-    const otp = Math.floor(100000 + Math.random() * 900000).toString();
+    // SECURITY FIX (High): Math.random() is not cryptographically secure —
+    // its output is predictable given enough samples, which matters for a
+    // 6-digit code guarding account access. crypto.randomInt is CSPRNG-backed.
+    const otp = crypto.randomInt(100000, 1000000).toString();
     const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
 
-    console.log(`Generated OTP ${otp} for user ${user.id}`);
+    // SECURITY FIX (High): never log the OTP itself — logs are read by
+    // more people (ops, log aggregators, third-party log drains) than the
+    // OTP's intended single recipient, and logging it defeats the point of
+    // having a secret code at all.
+    console.log(`Password reset OTP generated for user ${user.id}`);
 
     // Mark any existing OTPs as used
     await supabase
@@ -6005,6 +6063,27 @@ app.get(
             : null),
         to_user: rawTransaction.to_user || null,
       };
+
+            // Bill-payment transactions carry secret data (electricity
+      // token, exam PIN, etc.) on bill_transactions, joined via the
+      // shared transaction_reference — transactions_new has no such
+      // column itself. Attached as transaction.bill so the frontend
+      // can offer a "View Token/PIN" action from transaction history
+      // without a second round-trip. maybeSingle() (not single()) so
+      // a bill_payment-typed row with no matching bill_transactions
+      // record (shouldn't happen, but don't 500 if it does) just
+      // comes back null instead of throwing.
+      if (transaction.transaction_type === "bill_payment") {
+        const { data: billRow } = await supabase
+          .from("bill_transactions")
+          .select(
+            "id, status, failure_reason, secret_data, network, customer_identifier, bill_categories(code, name, returns_secret_data, secret_data_label), bill_providers(code, name)",
+          )
+          .eq("transaction_reference", transaction.transaction_reference)
+          .eq("user_id", req.user.id) // ownership check, same guard bills-service.js's status endpoint uses
+          .maybeSingle();
+        transaction.bill = billRow || null;
+      }
 
       // SECURITY CHECK: Failed transactions only visible to sender
       if (
@@ -6935,7 +7014,7 @@ app.post(
 
         if (txError) throw txError;
 
-        const otpCode = Math.floor(100000 + Math.random() * 900000).toString();
+        const otpCode = crypto.randomInt(100000, 1000000).toString(); // SECURITY FIX: cryptographically secure OTP
         const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
 
         await supabase.from("otps").insert({
@@ -7775,14 +7854,19 @@ app.post(
       const cardPrice = 3000; // Card price
 
       // Generate card details
+      // SECURITY FIX (Critical): card number and CVV were generated with
+      // Math.random(), which is not cryptographically secure and can be
+      // predicted/brute-forced with enough observed samples — a direct
+      // card-fraud risk. crypto.randomInt is CSPRNG-backed.
       const cardNumber =
         "4" +
-        Math.floor(Math.random() * 1000000000000000)
+        crypto
+          .randomInt(0, 1000000000000000)
           .toString()
           .padStart(15, "0");
       const expiryDate = new Date();
       expiryDate.setFullYear(expiryDate.getFullYear() + 3);
-      const cvv = Math.floor(100 + Math.random() * 900).toString();
+      const cvv = crypto.randomInt(100, 1000).toString();
 
       const { data: card, error } = await supabase
         .from("cards")
@@ -8128,6 +8212,7 @@ app.use("/api/sys/bills", authenticate, authorizeAdmin, billsAdminRouter);
 app.post(
   "/api/user/bills/verify-pin",
   authenticate,
+  pinVerifyLimiter,
   checkAccountFrozen,
   billsService.handleVerifyBillPaymentPin,
 );
@@ -8138,7 +8223,20 @@ app.post(
   billsService.billPaymentLimiter,
   billsService.handleCreateBillPayment,
 );
-app.get("/api/cron/process-bills", billsWorker.cronHandler); // add to vercel.json cron config, same pattern as your other workers
+app.get("/api/cron/process-bills", billsWorker.cronHandler); 
+
+app.get(
+  "/api/user/bills/:id/status",
+  authenticate,
+  billsService.handleGetBillStatus,
+); // was exported but never mounted — bills-frontend.js's status polling has been 404ing silently until now
+
+app.post(
+  "/api/user/bills/verify-customer",
+  authenticate,
+  checkAccountFrozen,
+  billsService.handleVerifyCustomer,
+);
 
 // Get exchange rates
 app.get("/api/user/exchange-rates", authenticate, async (req, res) => {
@@ -12511,7 +12609,7 @@ app.post(
       }
 
       // Generate 6-digit OTP
-      const otpCode = Math.floor(100000 + Math.random() * 900000).toString();
+      const otpCode = crypto.randomInt(100000, 1000000).toString(); // SECURITY FIX: cryptographically secure OTP
       const expiresAt = new Date();
       expiresAt.setMinutes(expiresAt.getMinutes() + 10); // 10 minutes expiry
 
@@ -12597,7 +12695,7 @@ app.post(
         .eq("is_used", false);
 
       // Generate new OTP
-      const otpCode = Math.floor(100000 + Math.random() * 900000).toString();
+      const otpCode = crypto.randomInt(100000, 1000000).toString(); // SECURITY FIX: cryptographically secure OTP
       const expiresAt = new Date();
       expiresAt.setMinutes(expiresAt.getMinutes() + 10);
 
@@ -13486,12 +13584,15 @@ app.get(
 // ==================== ADMIN RESET USER PASSWORD ====================
 
 // Helper: generate random password (e.g., 12 characters)
+// SECURITY FIX (High): was using Math.random(), which is not
+// cryptographically secure and is guessable with enough samples —
+// unacceptable for something that temporarily grants full account access.
 function generateRandomPassword() {
   const chars =
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*";
   let password = "";
   for (let i = 0; i < 12; i++) {
-    password += chars.charAt(Math.floor(Math.random() * chars.length));
+    password += chars.charAt(crypto.randomInt(0, chars.length));
   }
   return password;
 }
@@ -13580,7 +13681,7 @@ app.get("/api/user/has-pin", authenticate, async (req, res) => {
 });
 
 // Set/Update transfer PIN
-app.post("/api/user/set-transfer-pin", authenticate, async (req, res) => {
+app.post("/api/user/set-transfer-pin", authenticate, validate(schemas.setTransferPin), async (req, res) => {
   try {
     const { pin } = req.body;
 
@@ -13682,7 +13783,7 @@ app.post("/api/user/set-transfer-pin", authenticate, async (req, res) => {
   }
 });*/
 
-app.post("/api/user/verify-transfer-pin", authenticate, async (req, res) => {
+app.post("/api/user/verify-transfer-pin", authenticate, pinVerifyLimiter, validate(schemas.verifyTransferPin), async (req, res) => {
   try {
     const { pin, from_account_id, to_account_number, amount } = req.body;
 
@@ -13785,7 +13886,7 @@ app.post("/api/user/verify-transfer-pin", authenticate, async (req, res) => {
 // PIN/attempts/freeze checks but binds its token to (user, savings type,
 // savings id) instead — used by both dashboard.js's built-in withdraw flow
 // and can be reused by any future savings withdrawal flow.
-app.post("/api/user/verify-savings-pin", authenticate, async (req, res) => {
+app.post("/api/user/verify-savings-pin", authenticate, pinVerifyLimiter, validate(schemas.verifySavingsPin), async (req, res) => {
   try {
     const { pin, type, id } = req.body;
 
@@ -14207,42 +14308,36 @@ app.post(
           .json({ error: "User must be an admin to generate staff ID" });
       }
 
-      // Generate unique staff ID: FEE + 10 alphanumeric characters
+      // Generate a random staff ID: FEE + 10 alphanumeric characters.
+      // Keyspace is 36^10 (~3.6 x 10^15), so a random collision is
+      // statistically negligible — and now that we store a bcrypt hash
+      // (not the plaintext), we can no longer look up "does this exact
+      // value already exist" via equality anyway, since bcrypt salts each
+      // hash differently even for the same input.
       const generateStaffId = () => {
         const prefix = "FEE";
         const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
         let result = prefix;
         for (let i = 0; i < 10; i++) {
-          result += chars.charAt(Math.floor(Math.random() * chars.length));
+          result += chars.charAt(crypto.randomInt(0, chars.length)); // SECURITY FIX: cryptographically secure
         }
         return result;
       };
 
-      let staffId = generateStaffId();
-      let isUnique = false;
-      let attempts = 0;
+      const staffId = generateStaffId();
 
-      // Ensure uniqueness
-      while (!isUnique && attempts < 5) {
-        const { data: existing } = await supabase
-          .from("users")
-          .select("id")
-          .eq("admin_staff_id", staffId)
-          .single();
+      // SECURITY FIX (Critical): staff IDs act as a login credential (a
+      // second factor for admin accounts) and must never be stored in
+      // plaintext, same as passwords/PINs. Hash with bcrypt before saving;
+      // the plaintext is only ever returned once, here, to the super admin
+      // who generated it — same UX pattern as showing a temp password once.
+      const hashedStaffId = await bcrypt.hash(staffId, 10);
 
-        if (!existing) {
-          isUnique = true;
-        } else {
-          staffId = generateStaffId();
-        }
-        attempts++;
-      }
-
-      // Update user with new staff ID
+      // Update user with new (hashed) staff ID
       const { error: updateError } = await supabase
         .from("users")
         .update({
-          admin_staff_id: staffId,
+          admin_staff_id: hashedStaffId,
           admin_staff_id_set_at: new Date().toISOString(),
           admin_staff_id_verified: false,
           updated_at: new Date().toISOString(),
@@ -14251,12 +14346,14 @@ app.post(
 
       if (updateError) throw updateError;
 
-      // Log admin action
+      // Log admin action — do NOT persist the plaintext staff ID in the
+      // audit trail; logging it would just recreate the plaintext-storage
+      // problem in a second table.
       await supabase.from("admin_actions").insert({
         admin_id: req.user.id,
         action_type: "generate_staff_id",
         target_user_id: userId,
-        details: { staff_id: staffId },
+        details: { staff_id_generated: true },
         ip_address: req.ip,
         created_at: new Date().toISOString(),
       });
@@ -14264,7 +14361,8 @@ app.post(
       res.json({
         success: true,
         staff_id: staffId,
-        message: "Staff ID generated successfully",
+        message:
+          "Staff ID generated successfully. Save it now — it will not be shown again.",
       });
     } catch (error) {
       console.error("Generate staff ID error:", error);
@@ -14301,41 +14399,29 @@ app.post(
         return res.status(400).json({ error: "User must be an admin" });
       }
 
-      // Generate new staff ID
+      // Generate new staff ID (see generate-staff-id above for rationale
+      // on dropping the plaintext uniqueness pre-check)
       const generateStaffId = () => {
         const prefix = "FEE";
         const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
         let result = prefix;
         for (let i = 0; i < 10; i++) {
-          result += chars.charAt(Math.floor(Math.random() * chars.length));
+          result += chars.charAt(crypto.randomInt(0, chars.length)); // SECURITY FIX: cryptographically secure
         }
         return result;
       };
 
-      let staffId = generateStaffId();
-      let isUnique = false;
-      let attempts = 0;
+      const staffId = generateStaffId();
 
-      while (!isUnique && attempts < 5) {
-        const { data: existing } = await supabase
-          .from("users")
-          .select("id")
-          .eq("admin_staff_id", staffId)
-          .single();
+      // SECURITY FIX (Critical): hash before storing — see generate path
+      // above for full rationale.
+      const hashedStaffId = await bcrypt.hash(staffId, 10);
 
-        if (!existing) {
-          isUnique = true;
-        } else {
-          staffId = generateStaffId();
-        }
-        attempts++;
-      }
-
-      // Update with new staff ID
+      // Update with new (hashed) staff ID
       const { error: updateError } = await supabase
         .from("users")
         .update({
-          admin_staff_id: staffId,
+          admin_staff_id: hashedStaffId,
           admin_staff_id_set_at: new Date().toISOString(),
           admin_staff_id_verified: false,
           updated_at: new Date().toISOString(),
@@ -14344,12 +14430,12 @@ app.post(
 
       if (updateError) throw updateError;
 
-      // Log admin action
+      // Log admin action — no plaintext staff ID values in the audit log
       await supabase.from("admin_actions").insert({
         admin_id: req.user.id,
         action_type: "regenerate_staff_id",
         target_user_id: userId,
-        details: { old_staff_id: user.admin_staff_id, new_staff_id: staffId },
+        details: { staff_id_regenerated: true },
         ip_address: req.ip,
         created_at: new Date().toISOString(),
       });
@@ -14357,7 +14443,8 @@ app.post(
       res.json({
         success: true,
         staff_id: staffId,
-        message: "Staff ID regenerated successfully",
+        message:
+          "Staff ID regenerated successfully. Save it now — it will not be shown again.",
       });
     } catch (error) {
       console.error("Regenerate staff ID error:", error);
@@ -14367,7 +14454,7 @@ app.post(
 );
 
 // Verify staff ID during admin login
-app.post("/api/auth/verify-staff-id", async (req, res) => {
+app.post("/api/auth/verify-staff-id", staffIdLimiter, validate(schemas.verifyStaffId), async (req, res) => {
   try {
     const { userId, staff_id } = req.body;
 
@@ -14410,7 +14497,12 @@ app.post("/api/auth/verify-staff-id", async (req, res) => {
       });
     }
 
-    if (user.admin_staff_id !== staff_id) {
+    const staffIdMatches = await bcrypt.compare(
+      String(staff_id),
+      user.admin_staff_id,
+    );
+
+    if (!staffIdMatches) {
       // Log failed attempt
       await supabase.from("security_logs").insert({
         user_id: userId,
@@ -14469,9 +14561,13 @@ app.get(
 
       if (error) throw error;
 
+      // SECURITY FIX (Critical): never return the staff ID value itself —
+      // this was the account-takeover vector (any admin with access to
+      // this endpoint could read any other admin's staff ID). It's now a
+      // bcrypt hash anyway, which is useless to a legitimate caller and
+      // still shouldn't be handed back over the wire.
       res.json({
         has_staff_id: !!user.admin_staff_id,
-        staff_id: user.admin_staff_id,
         set_at: user.admin_staff_id_set_at,
         role: user.role,
       });
@@ -16977,7 +17073,7 @@ app.post(
     try {
       const { user_id, otp_type, transaction_id } = req.body;
 
-      const otpCode = Math.floor(100000 + Math.random() * 900000).toString();
+      const otpCode = crypto.randomInt(100000, 1000000).toString(); // SECURITY FIX: cryptographically secure OTP
       const expiresAt = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes
 
       const { data: otp, error } = await supabase
@@ -17722,9 +17818,10 @@ app.post(
       const { userId } = req.params;
 
       // Generate temporary password
+      // SECURITY FIX (High): Math.random() is not cryptographically secure.
       const tempPassword =
-        Math.random().toString(36).slice(-8) +
-        Math.random().toString(36).slice(-8).toUpperCase() +
+        crypto.randomBytes(6).toString("base64url") +
+        crypto.randomBytes(6).toString("base64url").toUpperCase() +
         "!1";
       const hashedPassword = await bcrypt.hash(tempPassword, 10);
 
