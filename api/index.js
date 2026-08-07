@@ -341,7 +341,10 @@ const serviceRegistryAdminRouter = require("../lib/service-registry-admin-routes
 
 const paystackWebhookHandler = require("../lib/paystack-webhook-handler");
 
-const { notifyAndPush, sendPushNotificationForInAppNotification } = require("../lib/notification-service");
+const {
+  notifyAndPush,
+  sendPushNotificationForInAppNotification,
+} = require("../lib/notification-service");
 
 app.post(
   "/api/webhooks/paystack",
@@ -382,6 +385,9 @@ app.get("/api/cron/virtual-accounts", virtualAccountWorker.cronHandler);
 
 const billsCatalogRouter = require("../lib/bills-catalog-routes");
 const billsAdminRouter = require("../lib/bills-admin-routes");
+
+const supportRoutes = require("../lib/support-routes");
+const supportAdminRoutes = require("../lib/support-admin-routes");
 
 const { sendToToken, sendToTokens } = require("../lib/fcm-service");
 
@@ -479,259 +485,6 @@ io.use(async (socket, next) => {
     next(new Error("Invalid token"));
   }
 });
-
-// Socket.IO connection handler
-io.on("connection", (socket) => {
-  console.log(`User connected: ${socket.user.id} (${socket.user.role})`);
-
-  // Store connected user
-  connectedUsers.set(socket.user.id, {
-    socketId: socket.id,
-    user: socket.user,
-    connectedAt: new Date(),
-  });
-
-  // Join user to their personal room
-  socket.join(`user_${socket.user.id}`);
-
-  // If admin, join admin room
-  if (socket.user.role === "admin" || socket.user.role === "super_admin") {
-    socket.join("admin_room");
-
-    // Send initial unread counts to admin
-    sendUnreadCountsToAdmin();
-
-    // Send list of active conversations
-    sendActiveConversationsToAdmin();
-  }
-
-  // Handle sending a message
-  socket.on("send_message", async (data) => {
-    try {
-      const { message, toUserId } = data;
-
-      if (!message || !message.trim()) {
-        return socket.emit("error", { message: "Message cannot be empty" });
-      }
-
-      const isAdmin =
-        socket.user.role === "admin" || socket.user.role === "super_admin";
-      const fromUserId = socket.user.id;
-      const toUser = isAdmin ? toUserId : null;
-
-      // Insert message into database
-      const { data: messageRecord, error } = await supabase
-        .from("live_support_messages")
-        .insert({
-          user_id: isAdmin ? toUserId : fromUserId,
-          admin_id: isAdmin ? fromUserId : null,
-          message: message.trim(),
-          is_from_admin: isAdmin,
-          status: "sent",
-          created_at: new Date().toISOString(),
-        })
-        .select()
-        .single();
-
-      if (error) throw error;
-
-      // Determine recipient
-      const recipientId = isAdmin ? toUserId : "admin_room";
-
-      // Emit to recipient
-      if (recipientId === "admin_room") {
-        // Send to all admins
-        io.to("admin_room").emit("new_message", {
-          message: messageRecord,
-          fromUser: {
-            id: fromUserId,
-            name: `${socket.user.first_name || ""} ${socket.user.last_name || ""}`.trim(),
-            email: socket.user.email,
-            isAdmin: false,
-          },
-        });
-
-        // Increment unread count for this user in admin view
-        const currentCount = userUnreadCounts.get(fromUserId) || 0;
-        userUnreadCounts.set(fromUserId, currentCount + 1);
-
-        // Update unread counts for all admins
-        sendUnreadCountsToAdmin();
-
-        // Update conversation list
-        sendActiveConversationsToAdmin();
-      } else {
-        // Send to specific user
-        const recipientSocket = connectedUsers.get(recipientId);
-        if (recipientSocket) {
-          io.to(recipientSocket.socketId).emit("new_message", {
-            message: messageRecord,
-            fromUser: {
-              id: fromUserId,
-              name: `${socket.user.first_name || ""} ${socket.user.last_name || ""}`.trim(),
-              isAdmin: isAdmin,
-            },
-          });
-        }
-      }
-
-      // Emit back to sender for confirmation
-      socket.emit("message_sent", messageRecord);
-    } catch (error) {
-      console.error("Send message error:", error);
-      socket.emit("error", { message: "Failed to send message" });
-    }
-  });
-
-  // Handle marking messages as read (when admin views a chat)
-  socket.on("mark_conversation_read", async (data) => {
-    const { userId } = data;
-
-    if (socket.user.role !== "admin" && socket.user.role !== "super_admin") {
-      return;
-    }
-
-    // Reset unread count for this user
-    userUnreadCounts.set(userId, 0);
-
-    // Update database - mark messages as read
-    await supabase
-      .from("live_support_messages")
-      .update({
-        status: "read",
-        read_at: new Date().toISOString(),
-      })
-      .eq("user_id", userId)
-      .eq("is_from_admin", false)
-      .eq("status", "sent");
-
-    // Send updated counts to all admins
-    sendUnreadCountsToAdmin();
-    sendActiveConversationsToAdmin();
-  });
-
-  // Handle typing indicator
-  socket.on("typing", (data) => {
-    const { toUserId, isTyping } = data;
-    const isAdmin =
-      socket.user.role === "admin" || socket.user.role === "super_admin";
-
-    const recipientId = isAdmin ? toUserId : "admin_room";
-
-    if (recipientId === "admin_room") {
-      socket.to("admin_room").emit("user_typing", {
-        userId: socket.user.id,
-        userName:
-          `${socket.user.first_name || ""} ${socket.user.last_name || ""}`.trim(),
-        isTyping,
-      });
-    } else {
-      const recipientSocket = connectedUsers.get(recipientId);
-      if (recipientSocket) {
-        io.to(recipientSocket.socketId).emit("user_typing", {
-          userId: socket.user.id,
-          isTyping,
-        });
-      }
-    }
-  });
-
-  // Handle disconnection
-  socket.on("disconnect", () => {
-    console.log(`User disconnected: ${socket.user.id}`);
-    connectedUsers.delete(socket.user.id);
-
-    // Update admin view
-    if (socket.user.role !== "admin") {
-      sendActiveConversationsToAdmin();
-    }
-  });
-});
-
-// Helper function to send unread counts to all admins
-async function sendUnreadCountsToAdmin() {
-  // Get all users who have sent messages
-  const { data: allMessages } = await supabase
-    .from("live_support_messages")
-    .select("user_id, status")
-    .eq("is_from_admin", false)
-    .eq("status", "sent")
-    .order("created_at", { ascending: false });
-
-  // Calculate unread counts per user
-  const unreadCounts = {};
-  for (const msg of allMessages || []) {
-    unreadCounts[msg.user_id] = (unreadCounts[msg.user_id] || 0) + 1;
-  }
-
-  // Update our map
-  for (const [userId, count] of Object.entries(unreadCounts)) {
-    userUnreadCounts.set(userId, count);
-  }
-
-  // Send to all admins
-  io.to("admin_room").emit(
-    "unread_counts",
-    Object.fromEntries(userUnreadCounts),
-  );
-}
-
-// Helper function to send active conversations to admin
-async function sendActiveConversationsToAdmin() {
-  // Get all users who have sent messages, with their latest message
-  const { data: conversations } = await supabase
-    .from("live_support_messages")
-    .select(
-      `
-      user_id,
-      users!live_support_messages_user_id_fkey (
-        id,
-        first_name,
-        last_name,
-        email
-      ),
-      message,
-      created_at,
-      is_from_admin,
-      status
-    `,
-    )
-    .order("created_at", { ascending: false });
-
-  // Group by user and get latest message
-  const userConversations = new Map();
-
-  for (const msg of conversations || []) {
-    if (!userConversations.has(msg.user_id)) {
-      const unreadCount = userUnreadCounts.get(msg.user_id) || 0;
-      userConversations.set(msg.user_id, {
-        user_id: msg.user_id,
-        user_name: msg.users
-          ? `${msg.users.first_name || ""} ${msg.users.last_name || ""}`.trim()
-          : "Unknown User",
-        user_email: msg.users?.email || "",
-        last_message: msg.message,
-        last_message_time: msg.created_at,
-        last_message_is_from_admin: msg.is_from_admin,
-        unread_count: unreadCount,
-        status: msg.status,
-      });
-    }
-  }
-
-  // Convert to array and sort: unread first, then by last message time
-  const sortedConversations = Array.from(userConversations.values()).sort(
-    (a, b) => {
-      // Unread conversations first
-      if (a.unread_count > 0 && b.unread_count === 0) return -1;
-      if (a.unread_count === 0 && b.unread_count > 0) return 1;
-      // Then by last message time (newest first)
-      return new Date(b.last_message_time) - new Date(a.last_message_time);
-    },
-  );
-
-  io.to("admin_room").emit("active_conversations", sortedConversations);
-}
 
 // Replace app.listen with server.listen
 const PORT = process.env.PORT || 3000;
@@ -911,8 +664,8 @@ testEmailConfig();
       }
     }*/
 
-    // Send to all active tokens
-    /*for (const token of tokens) {
+// Send to all active tokens
+/*for (const token of tokens) {
       try {
         if (token.platform === "android" || token.platform === "ios") {
           const result = await sendToToken(token.push_token, {
@@ -1788,770 +1541,788 @@ app.post("/api/test-connection", (req, res) => {
 
 // ==================== AUTHENTICATION ROUTES ====================
 
-app.post("/api/auth/register", registerLimiter, validate(schemas.register), async (req, res) => {
-  try {
-    const {
-      email,
-      password,
-      first_name,
-      last_name,
-      middle_name,
-      phone,
-      country,
-      state,
-      city,
-      address,
-      postal_code,
-      date_of_birth,
-      gender,
-      marital_status,
-      occupation,
-      referral_code,
-      age,
-      security_question_1,
-      security_answer_1,
-      security_question_2,
-      security_answer_2,
-      passcode,
-      face_images,
-      bvn,
-    } = req.body;
+app.post(
+  "/api/auth/register",
+  registerLimiter,
+  validate(schemas.register),
+  async (req, res) => {
+    try {
+      const {
+        email,
+        password,
+        first_name,
+        last_name,
+        middle_name,
+        phone,
+        country,
+        state,
+        city,
+        address,
+        postal_code,
+        date_of_birth,
+        gender,
+        marital_status,
+        occupation,
+        referral_code,
+        age,
+        security_question_1,
+        security_answer_1,
+        security_question_2,
+        security_answer_2,
+        passcode,
+        face_images,
+        bvn,
+      } = req.body;
 
-    console.log("Registration attempt for:", email);
-    console.log("Face images received:", face_images ? face_images.length : 0);
+      console.log("Registration attempt for:", email);
+      console.log(
+        "Face images received:",
+        face_images ? face_images.length : 0,
+      );
 
-    // Validation
-    if (age && (age < 18 || age > 120)) {
-      return res.status(400).json({ error: "Age must be between 18 and 120" });
-    }
-
-    // Validate passcode (6 digits)
-    if (passcode && !/^\d{6}$/.test(passcode)) {
-      return res
-        .status(400)
-        .json({ error: "Passcode must be exactly 6 digits" });
-    }
-
-    // Validate BVN (required — needed to create a permanent Flutterwave
-    // dedicated virtual account immediately after registration)
-    if (!bvn || !/^\d{11}$/.test(bvn)) {
-      return res
-        .status(400)
-        .json({ error: "A valid 11-digit BVN is required" });
-    }
-
-    // Check if user exists
-    const { data: existingUser } = await withDbTimeout(
-      supabase.from("users").select("email").eq("email", email).single(),
-    );
-
-    if (existingUser) {
-      return res.status(400).json({ error: "Email already registered" });
-    }
-
-    // Hash password
-    const hashedPassword = await bcrypt.hash(password, 10);
-
-    // Hash passcode if provided
-    let hashedPasscode = null;
-    if (passcode) {
-      hashedPasscode = await bcrypt.hash(passcode, 10);
-    }
-
-    // Hash security answers
-    const hashedAnswer1 = await bcrypt.hash(
-      security_answer_1?.toLowerCase().trim() || "",
-      10,
-    );
-    const hashedAnswer2 = await bcrypt.hash(
-      security_answer_2?.toLowerCase().trim() || "",
-      10,
-    );
-
-    // Calculate age from date_of_birth if not provided
-    let calculatedAge = age;
-    if (!calculatedAge && date_of_birth) {
-      const birthDate = new Date(date_of_birth);
-      const today = new Date();
-      calculatedAge = today.getFullYear() - birthDate.getFullYear();
-      const monthDiff = today.getMonth() - birthDate.getMonth();
-      if (
-        monthDiff < 0 ||
-        (monthDiff === 0 && today.getDate() < birthDate.getDate())
-      ) {
-        calculatedAge--;
+      // Validation
+      if (age && (age < 18 || age > 120)) {
+        return res
+          .status(400)
+          .json({ error: "Age must be between 18 and 120" });
       }
-    }
 
-    // Create user with all fields - NO ID FIELDS
-    const { data: user, error } = await withDbTimeout(
-      supabase
-        .from("users")
+      // Validate passcode (6 digits)
+      if (passcode && !/^\d{6}$/.test(passcode)) {
+        return res
+          .status(400)
+          .json({ error: "Passcode must be exactly 6 digits" });
+      }
+
+      // Validate BVN (required — needed to create a permanent Flutterwave
+      // dedicated virtual account immediately after registration)
+      if (!bvn || !/^\d{11}$/.test(bvn)) {
+        return res
+          .status(400)
+          .json({ error: "A valid 11-digit BVN is required" });
+      }
+
+      // Check if user exists
+      const { data: existingUser } = await withDbTimeout(
+        supabase.from("users").select("email").eq("email", email).single(),
+      );
+
+      if (existingUser) {
+        return res.status(400).json({ error: "Email already registered" });
+      }
+
+      // Hash password
+      const hashedPassword = await bcrypt.hash(password, 10);
+
+      // Hash passcode if provided
+      let hashedPasscode = null;
+      if (passcode) {
+        hashedPasscode = await bcrypt.hash(passcode, 10);
+      }
+
+      // Hash security answers
+      const hashedAnswer1 = await bcrypt.hash(
+        security_answer_1?.toLowerCase().trim() || "",
+        10,
+      );
+      const hashedAnswer2 = await bcrypt.hash(
+        security_answer_2?.toLowerCase().trim() || "",
+        10,
+      );
+
+      // Calculate age from date_of_birth if not provided
+      let calculatedAge = age;
+      if (!calculatedAge && date_of_birth) {
+        const birthDate = new Date(date_of_birth);
+        const today = new Date();
+        calculatedAge = today.getFullYear() - birthDate.getFullYear();
+        const monthDiff = today.getMonth() - birthDate.getMonth();
+        if (
+          monthDiff < 0 ||
+          (monthDiff === 0 && today.getDate() < birthDate.getDate())
+        ) {
+          calculatedAge--;
+        }
+      }
+
+      // Create user with all fields - NO ID FIELDS
+      const { data: user, error } = await withDbTimeout(
+        supabase
+          .from("users")
+          .insert({
+            email,
+            password_hash: hashedPassword,
+            first_name,
+            last_name,
+            middle_name: middle_name || null,
+            phone,
+            country: country || null,
+            state: state || null,
+            city: city || null,
+            address: address || null,
+            postal_code: postal_code || null,
+            date_of_birth: date_of_birth || null,
+            gender: gender || null,
+            marital_status: marital_status || null,
+            occupation: occupation || null,
+            referral_code: referral_code || null,
+            age: calculatedAge || null,
+            bvn,
+            security_question_1,
+            security_answer_1: hashedAnswer1,
+            security_question_2,
+            security_answer_2: hashedAnswer2,
+            passcode_hash: hashedPasscode,
+            passcode_set_at: hashedPasscode ? new Date().toISOString() : null,
+            face_verified: !!face_images && face_images.length > 0,
+            face_verification_date:
+              face_images && face_images.length > 0
+                ? new Date().toISOString()
+                : null,
+            role: "user",
+            kyc_status: "pending",
+            is_active: true,
+            is_frozen: false,
+            account_tier: 1, // ALL NEW USERS START AT TIER 1
+            created_at: new Date().toISOString(),
+            updated_at: new Date().toISOString(),
+          })
+          .select()
+          .single(),
+        12000, // account creation is heavier than a lookup - a bit more headroom
+      );
+
+      if (error) {
+        console.error("Supabase insert error:", error);
+        throw error;
+      }
+
+      console.log("User created with ID:", user.id);
+
+      // ==================== PRODUCTION-GRADE FACE STORAGE ====================
+      if (face_images && face_images.length > 0) {
+        console.log(
+          `[FACE] Processing ${face_images.length} face images for user ${user.id}`,
+        );
+
+        const faceDescriptorVectors = req.body.face_descriptors || [];
+        const faceQualityScores = req.body.face_quality_scores || [];
+
+        // ── Step 1: Collect all valid 128-D vectors ─────────────────────────────
+        const validFrames = []; // { vector, quality, image, index }
+        for (let i = 0; i < face_images.length; i++) {
+          const vector = faceDescriptorVectors[i];
+          const quality = faceQualityScores[i] || 0.8;
+          if (vector && Array.isArray(vector) && vector.length === 128) {
+            validFrames.push({
+              vector,
+              quality,
+              image: face_images[i],
+              index: i,
+            });
+          }
+        }
+        console.log(
+          `[FACE] ${validFrames.length}/${face_images.length} frames have valid 128-D vectors`,
+        );
+
+        // ── Step 2: Compute averaged canonical embedding ─────────────────────────
+        // Averaging all captures is more robust than picking one frame.
+        let canonicalVector = null;
+        let bestQuality = 0;
+        let bestImage = null;
+
+        if (validFrames.length > 0) {
+          const avg = new Array(128).fill(0);
+          for (const frame of validFrames) {
+            for (let j = 0; j < 128; j++)
+              avg[j] += frame.vector[j] / validFrames.length;
+          }
+          canonicalVector = avg;
+
+          // Also track the single highest-quality frame for reference
+          const bestFrame = validFrames.reduce((a, b) =>
+            b.quality > a.quality ? b : a,
+          );
+          bestQuality = bestFrame.quality;
+          bestImage = bestFrame.image;
+        }
+
+        // ── Step 3: Clean slate — remove old descriptors for this user ──────────
+        const { error: deleteError } = await supabase
+          .from("face_descriptors")
+          .delete()
+          .eq("user_id", user.id);
+        if (deleteError)
+          console.error("[FACE] Error clearing old descriptors:", deleteError);
+
+        // ── Step 4: Insert one PRIMARY row with the clean flat canonical vector ──
+        // This is what getUserFaceDescriptor() reads. Storing as a plain array
+        // (not nested in an object) means all three extraction paths in that
+        // function will find it reliably.
+        if (canonicalVector) {
+          const { error: primaryErr } = await supabase
+            .from("face_descriptors")
+            .insert({
+              user_id: user.id,
+              descriptor: canonicalVector, // flat 128-number array → JSONB
+              is_primary: true,
+              is_active: true,
+              quality_score: bestQuality,
+              version: 1,
+              created_at: new Date().toISOString(),
+            });
+
+          if (primaryErr) {
+            console.error(
+              "[FACE] Failed to insert primary descriptor:",
+              primaryErr,
+            );
+          } else {
+            console.log(
+              "[FACE] ✅ Inserted primary (averaged) descriptor into face_descriptors",
+            );
+          }
+
+          // ── Step 5: Insert individual frame rows (audit / re-train use) ─────────
+          // These are stored with the nested format {image, vector, angle} for
+          // forensic purposes. They are NOT the ones used for verification lookup.
+          let frameInsertCount = 0;
+          for (const frame of validFrames) {
+            const { error: frameErr } = await supabase
+              .from("face_descriptors")
+              .insert({
+                user_id: user.id,
+                descriptor: {
+                  vector: frame.vector, // nested — for audit only
+                  image: frame.image,
+                  angle: frame.index,
+                  quality: frame.quality,
+                  timestamp: new Date().toISOString(),
+                  is_valid: true,
+                },
+                is_primary: false,
+                is_active: true,
+                quality_score: frame.quality,
+                version: 1,
+                created_at: new Date().toISOString(),
+              });
+            if (!frameErr) frameInsertCount++;
+            else
+              console.error(
+                `[FACE] Frame ${frame.index} insert error:`,
+                frameErr,
+              );
+          }
+          console.log(
+            `[FACE] Inserted ${frameInsertCount}/${validFrames.length} frame rows`,
+          );
+
+          // ── Step 6: Store canonical embedding in users table ────────────────────
+          // users.face_embedding is the fastest lookup path (no join needed).
+          // Always store as a flat JSON array string so parsing is unambiguous.
+          const { error: updateError } = await supabase
+            .from("users")
+            .update({
+              face_embedding: JSON.stringify(canonicalVector), // flat array string
+              face_verified: true,
+              face_quality_score: bestQuality,
+              face_image: bestImage || null,
+              face_verification_date: new Date().toISOString(),
+              face_embedding_version: 1,
+              updated_at: new Date().toISOString(),
+            })
+            .eq("id", user.id);
+
+          if (updateError) {
+            console.error(
+              "[FACE] Failed to update users.face_embedding:",
+              updateError,
+            );
+          } else {
+            console.log(
+              "[FACE] ✅ users.face_embedding updated with canonical vector",
+            );
+          }
+        } else {
+          // Images received but no valid 128-D descriptor vectors were sent
+          console.warn(
+            "[FACE] No valid face vectors in payload — face_verified stays false",
+          );
+          await supabase
+            .from("users")
+            .update({ face_verified: false, face_verification_date: null })
+            .eq("id", user.id);
+        }
+      }
+
+      // ========== CREATE CHECKING ACCOUNT ==========
+      // Create checking account for user. The DB trigger still stamps a
+      // placeholder ACC number synchronously so account_number stays
+      // NOT NULL/UNIQUE everywhere else in the app that reads it. The real
+      // Flutterwave permanent virtual account number replaces it once the
+      // background job below completes (creation_status: PENDING -> ACTIVE).
+      const { data: newAccount, error: accountError } = await supabase
+        .from("accounts")
         .insert({
-          email,
-          password_hash: hashedPassword,
-          first_name,
-          last_name,
-          middle_name: middle_name || null,
-          phone,
-          country: country || null,
-          state: state || null,
-          city: city || null,
-          address: address || null,
-          postal_code: postal_code || null,
-          date_of_birth: date_of_birth || null,
-          gender: gender || null,
-          marital_status: marital_status || null,
-          occupation: occupation || null,
-          referral_code: referral_code || null,
-          age: calculatedAge || null,
-          bvn,
-          security_question_1,
-          security_answer_1: hashedAnswer1,
-          security_question_2,
-          security_answer_2: hashedAnswer2,
-          passcode_hash: hashedPasscode,
-          passcode_set_at: hashedPasscode ? new Date().toISOString() : null,
-          face_verified: !!face_images && face_images.length > 0,
-          face_verification_date:
-            face_images && face_images.length > 0
-              ? new Date().toISOString()
-              : null,
-          role: "user",
-          kyc_status: "pending",
-          is_active: true,
-          is_frozen: false,
-          account_tier: 1, // ALL NEW USERS START AT TIER 1
+          user_id: user.id,
+          account_type: "checking",
+          currency: "NGN",
+          balance: 0.0,
+          available_balance: 0.0,
+          status: "active",
+          creation_status: "PENDING",
           created_at: new Date().toISOString(),
           updated_at: new Date().toISOString(),
         })
         .select()
-        .single(),
-      12000, // account creation is heavier than a lookup - a bit more headroom
-    );
-
-    if (error) {
-      console.error("Supabase insert error:", error);
-      throw error;
-    }
-
-    console.log("User created with ID:", user.id);
-
-    // ==================== PRODUCTION-GRADE FACE STORAGE ====================
-    if (face_images && face_images.length > 0) {
-      console.log(
-        `[FACE] Processing ${face_images.length} face images for user ${user.id}`,
-      );
-
-      const faceDescriptorVectors = req.body.face_descriptors || [];
-      const faceQualityScores = req.body.face_quality_scores || [];
-
-      // ── Step 1: Collect all valid 128-D vectors ─────────────────────────────
-      const validFrames = []; // { vector, quality, image, index }
-      for (let i = 0; i < face_images.length; i++) {
-        const vector = faceDescriptorVectors[i];
-        const quality = faceQualityScores[i] || 0.8;
-        if (vector && Array.isArray(vector) && vector.length === 128) {
-          validFrames.push({
-            vector,
-            quality,
-            image: face_images[i],
-            index: i,
-          });
-        }
-      }
-      console.log(
-        `[FACE] ${validFrames.length}/${face_images.length} frames have valid 128-D vectors`,
-      );
-
-      // ── Step 2: Compute averaged canonical embedding ─────────────────────────
-      // Averaging all captures is more robust than picking one frame.
-      let canonicalVector = null;
-      let bestQuality = 0;
-      let bestImage = null;
-
-      if (validFrames.length > 0) {
-        const avg = new Array(128).fill(0);
-        for (const frame of validFrames) {
-          for (let j = 0; j < 128; j++)
-            avg[j] += frame.vector[j] / validFrames.length;
-        }
-        canonicalVector = avg;
-
-        // Also track the single highest-quality frame for reference
-        const bestFrame = validFrames.reduce((a, b) =>
-          b.quality > a.quality ? b : a,
-        );
-        bestQuality = bestFrame.quality;
-        bestImage = bestFrame.image;
-      }
-
-      // ── Step 3: Clean slate — remove old descriptors for this user ──────────
-      const { error: deleteError } = await supabase
-        .from("face_descriptors")
-        .delete()
-        .eq("user_id", user.id);
-      if (deleteError)
-        console.error("[FACE] Error clearing old descriptors:", deleteError);
-
-      // ── Step 4: Insert one PRIMARY row with the clean flat canonical vector ──
-      // This is what getUserFaceDescriptor() reads. Storing as a plain array
-      // (not nested in an object) means all three extraction paths in that
-      // function will find it reliably.
-      if (canonicalVector) {
-        const { error: primaryErr } = await supabase
-          .from("face_descriptors")
-          .insert({
-            user_id: user.id,
-            descriptor: canonicalVector, // flat 128-number array → JSONB
-            is_primary: true,
-            is_active: true,
-            quality_score: bestQuality,
-            version: 1,
-            created_at: new Date().toISOString(),
-          });
-
-        if (primaryErr) {
-          console.error(
-            "[FACE] Failed to insert primary descriptor:",
-            primaryErr,
-          );
-        } else {
-          console.log(
-            "[FACE] ✅ Inserted primary (averaged) descriptor into face_descriptors",
-          );
-        }
-
-        // ── Step 5: Insert individual frame rows (audit / re-train use) ─────────
-        // These are stored with the nested format {image, vector, angle} for
-        // forensic purposes. They are NOT the ones used for verification lookup.
-        let frameInsertCount = 0;
-        for (const frame of validFrames) {
-          const { error: frameErr } = await supabase
-            .from("face_descriptors")
-            .insert({
-              user_id: user.id,
-              descriptor: {
-                vector: frame.vector, // nested — for audit only
-                image: frame.image,
-                angle: frame.index,
-                quality: frame.quality,
-                timestamp: new Date().toISOString(),
-                is_valid: true,
-              },
-              is_primary: false,
-              is_active: true,
-              quality_score: frame.quality,
-              version: 1,
-              created_at: new Date().toISOString(),
-            });
-          if (!frameErr) frameInsertCount++;
-          else
-            console.error(
-              `[FACE] Frame ${frame.index} insert error:`,
-              frameErr,
-            );
-        }
-        console.log(
-          `[FACE] Inserted ${frameInsertCount}/${validFrames.length} frame rows`,
-        );
-
-        // ── Step 6: Store canonical embedding in users table ────────────────────
-        // users.face_embedding is the fastest lookup path (no join needed).
-        // Always store as a flat JSON array string so parsing is unambiguous.
-        const { error: updateError } = await supabase
-          .from("users")
-          .update({
-            face_embedding: JSON.stringify(canonicalVector), // flat array string
-            face_verified: true,
-            face_quality_score: bestQuality,
-            face_image: bestImage || null,
-            face_verification_date: new Date().toISOString(),
-            face_embedding_version: 1,
-            updated_at: new Date().toISOString(),
-          })
-          .eq("id", user.id);
-
-        if (updateError) {
-          console.error(
-            "[FACE] Failed to update users.face_embedding:",
-            updateError,
-          );
-        } else {
-          console.log(
-            "[FACE] ✅ users.face_embedding updated with canonical vector",
-          );
-        }
-      } else {
-        // Images received but no valid 128-D descriptor vectors were sent
-        console.warn(
-          "[FACE] No valid face vectors in payload — face_verified stays false",
-        );
-        await supabase
-          .from("users")
-          .update({ face_verified: false, face_verification_date: null })
-          .eq("id", user.id);
-      }
-    }
-
-    // ========== CREATE CHECKING ACCOUNT ==========
-    // Create checking account for user. The DB trigger still stamps a
-    // placeholder ACC number synchronously so account_number stays
-    // NOT NULL/UNIQUE everywhere else in the app that reads it. The real
-    // Flutterwave permanent virtual account number replaces it once the
-    // background job below completes (creation_status: PENDING -> ACTIVE).
-    const { data: newAccount, error: accountError } = await supabase
-      .from("accounts")
-      .insert({
-        user_id: user.id,
-        account_type: "checking",
-        currency: "NGN",
-        balance: 0.0,
-        available_balance: 0.0,
-        status: "active",
-        creation_status: "PENDING",
-        created_at: new Date().toISOString(),
-        updated_at: new Date().toISOString(),
-      })
-      .select()
-      .single();
-
-    if (accountError) {
-      console.error("Account creation error:", accountError);
-    }
-
-    // ========== ENQUEUE VIRTUAL ACCOUNT CREATION JOB ==========
-    // Never call Flutterwave inline here — registration must succeed
-    // regardless of Flutterwave's availability. A worker picks this up
-    // separately (immediately via fire-and-forget below, and again on the
-    // cron sweep if that attempt is lost).
-    let enqueuedJobId = null;
-    if (newAccount && !accountError) {
-      const { data: job, error: jobError } = await supabase
-        .from("background_jobs")
-        .insert({
-          job_type: "create_virtual_account",
-          payload: {
-            user_id: user.id,
-            account_id: newAccount.id,
-            email: user.email,
-            bvn,
-            first_name: user.first_name,
-            last_name: user.last_name,
-            phone: user.phone,
-          },
-          status: "pending",
-          priority: 100,
-        })
-        .select()
         .single();
 
-      if (jobError) {
-        console.error("Failed to enqueue virtual account job:", jobError);
-      } else {
-        enqueuedJobId = job.id;
+      if (accountError) {
+        console.error("Account creation error:", accountError);
       }
-    }
 
-    // ========== PRODUCTION SESSION MANAGEMENT FOR REGISTRATION ==========
+      // ========== ENQUEUE VIRTUAL ACCOUNT CREATION JOB ==========
+      // Never call Flutterwave inline here — registration must succeed
+      // regardless of Flutterwave's availability. A worker picks this up
+      // separately (immediately via fire-and-forget below, and again on the
+      // cron sweep if that attempt is lost).
+      let enqueuedJobId = null;
+      if (newAccount && !accountError) {
+        const { data: job, error: jobError } = await supabase
+          .from("background_jobs")
+          .insert({
+            job_type: "create_virtual_account",
+            payload: {
+              user_id: user.id,
+              account_id: newAccount.id,
+              email: user.email,
+              bvn,
+              first_name: user.first_name,
+              last_name: user.last_name,
+              phone: user.phone,
+            },
+            status: "pending",
+            priority: 100,
+          })
+          .select()
+          .single();
 
-    // Get device info
-    const deviceInfo = getDeviceInfo(req);
-    const sessionVersion = Math.floor(Date.now() / 1000);
-    const sessionId = generateSessionId();
+        if (jobError) {
+          console.error("Failed to enqueue virtual account job:", jobError);
+        } else {
+          enqueuedJobId = job.id;
+        }
+      }
 
-    // STEP 1: Get ALL existing active sessions for this user (should be none for new user)
-    const { data: existingSessions } = await withDbTimeout(
-      supabase
-        .from("user_sessions")
-        .select("id, session_id, device_name, session_token")
-        .eq("user_id", user.id)
-        .eq("is_active", true),
-    );
+      // ========== PRODUCTION SESSION MANAGEMENT FOR REGISTRATION ==========
 
-    // STEP 2: Generate token with session info (MATCHES LOGIN FORMAT)
-    const token = jwt.sign(
-      {
-        userId: user.id,
-        email: user.email,
-        role: user.role,
-        sessionId: sessionId,
-        sessionVersion: sessionVersion,
-        issuedAt: Date.now(),
-      },
-      process.env.JWT_SECRET,
-      { expiresIn: process.env.JWT_EXPIRE || "7d" },
-    );
+      // Get device info
+      const deviceInfo = getDeviceInfo(req);
+      const sessionVersion = Math.floor(Date.now() / 1000);
+      const sessionId = generateSessionId();
 
-    const expiresAt = new Date();
-    expiresAt.setDate(expiresAt.getDate() + 7);
-
-    // STEP 3: Insert the new session (MATCHES LOGIN)
-    const { error: sessionError } = await withDbTimeout(
-      supabase.from("user_sessions").insert({
-        user_id: user.id,
-        session_token: token,
-        session_id: sessionId,
-        device_fingerprint: deviceInfo.device_name,
-        device_name: deviceInfo.device_name,
-        ip_address: deviceInfo.ip_address,
-        user_agent: deviceInfo.user_agent,
-        expires_at: expiresAt.toISOString(),
-        is_active: true,
-        is_current: true,
-        session_version: sessionVersion,
-        created_at: new Date().toISOString(),
-        last_activity: new Date().toISOString(),
-      }),
-    );
-
-    if (sessionError) {
-      console.error("Session insert error during registration:", sessionError);
-      // Don't fail registration, just log it
-    }
-
-    // STEP 4: Update user record with active session (MATCHES LOGIN)
-    await withDbTimeout(
-      supabase
-        .from("users")
-        .update({
-          active_session_id: sessionId,
-          last_active_device: deviceInfo.device_name,
-          active_session_started_at: new Date().toISOString(),
-          last_login: new Date().toISOString(),
-          session_version: sessionVersion,
-        })
-        .eq("id", user.id),
-    );
-
-    // STEP 5: Invalidate any existing sessions (should be none, but safe)
-    if (existingSessions && existingSessions.length > 0) {
-      console.log(
-        `Invalidating ${existingSessions.length} existing session(s) for new user ${user.id}`,
-      );
-
-      await withDbTimeout(
+      // STEP 1: Get ALL existing active sessions for this user (should be none for new user)
+      const { data: existingSessions } = await withDbTimeout(
         supabase
           .from("user_sessions")
-          .update({
-            is_active: false,
-            is_current: false,
-            invalidated_reason: `New registration from ${deviceInfo.device_name}`,
-            expires_at: new Date().toISOString(),
-          })
-          .in(
-            "id",
-            existingSessions.map((s) => s.id),
-          ),
-      );
-    }
-
-    // STEP 6: Log successful registration
-    await logSecurityEvent(user.id, "user_registered", {
-      ip: req.ip,
-      device: deviceInfo.device_name,
-      session_id: sessionId,
-    });
-
-    // Kick off virtual account creation immediately, without making the
-    // user wait for Flutterwave. On Vercel's Node.js runtime, a plain
-    // fire-and-forget async call can be killed the instant the response
-    // is sent, so this uses waitUntil() to keep the function alive until
-    // the job attempt finishes (requires `npm install @vercel/functions`).
-    // If this attempt fails for any reason, the cron sweep in
-    // virtual-account-worker.js retries it on the normal backoff schedule
-    // — registration success never depends on this succeeding.
-    if (enqueuedJobId) {
-      try {
-        const { waitUntil } = require("@vercel/functions");
-        waitUntil(virtualAccountWorker.processOne(enqueuedJobId));
-      } catch (waitUntilErr) {
-        // @vercel/functions not installed / not running on Vercel — fall
-        // back to plain fire-and-forget; the cron sweep still covers it.
-        virtualAccountWorker
-          .processOne(enqueuedJobId)
-          .catch((e) => console.error("processOne fallback failed:", e));
-      }
-    }
-
-    // Return response with token and session info
-    res.status(201).json({
-      message: "User created successfully",
-      token: token,
-      session: {
-        id: sessionId,
-        device: deviceInfo.device_name,
-        logged_in_at: new Date().toISOString(),
-      },
-      user: {
-        id: user.id,
-        email: user.email,
-        first_name: user.first_name,
-        last_name: user.last_name,
-        middle_name: user.middle_name,
-        role: user.role,
-        phone: user.phone,
-        country: user.country,
-        state: user.state,
-        city: user.city,
-        age: user.age,
-        gender: user.gender,
-        marital_status: user.marital_status,
-        occupation: user.occupation,
-        has_passcode: !!user.passcode_hash,
-        face_verified: user.face_verified,
-        face_images_count: face_images ? face_images.length : 0,
-      },
-    });
-  } catch (error) {
-    console.error("Registration error:", error);
-    res.status(500).json({ error: "Registration failed: " + error.message });
-  }
-});
-
-// In index.js - REPLACE the login endpoint with this stricter version
-
-app.post("/api/auth/login", authLimiter, validate(schemas.login), async (req, res) => {
-  try {
-    const { email, password, fingerprint } = req.body;
-    const ip = req.ip;
-
-    // Failed attempts check (keep your existing code)
-    const attemptsKey = `${ip}:${email}`;
-    const attempts = failedAttempts.get(attemptsKey) || {
-      count: 0,
-      firstAttempt: Date.now(),
-    };
-
-    if (Date.now() - attempts.firstAttempt > 15 * 60 * 1000) {
-      attempts.count = 0;
-      attempts.firstAttempt = Date.now();
-    }
-
-    if (attempts.count >= 5) {
-      return res.status(429).json({
-        error: "Too many failed attempts. Account temporarily locked.",
-      });
-    }
-
-    // Fetch user
-    const { data: user, error } = await withDbTimeout(
-      supabase.from("users").select("*").eq("email", email).single(),
-    );
-
-    if (error || !user) {
-      attempts.count++;
-      failedAttempts.set(attemptsKey, attempts);
-      return res.status(401).json({ error: "Invalid credentials" });
-    }
-
-    // Password check
-    const validPassword = await bcrypt.compare(password, user.password_hash);
-    if (!validPassword) {
-      attempts.count++;
-      failedAttempts.set(attemptsKey, attempts);
-      await logSecurityEvent(user.id, "failed_login", { ip, fingerprint });
-      return res.status(401).json({ error: "Invalid credentials" });
-    }
-
-    // Account status checks
-    if (!user.is_active) {
-      return res.status(403).json({ error: "Account is deactivated" });
-    }
-
-    if (user.is_frozen) {
-      return res.status(403).json({
-        error: "Account frozen",
-        freeze_reason: user.freeze_reason,
-        unfreeze_method: user.unfreeze_method,
-      });
-    }
-
-    // Clear failed attempts
-    failedAttempts.delete(attemptsKey);
-
-    // ========== CHECK IF 2FA IS ENABLED ==========
-    if (user.two_factor_enabled) {
-      // Generate OTP
-      const otpCode = crypto.randomInt(100000, 1000000).toString(); // SECURITY FIX: cryptographically secure OTP
-      const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
-
-      // Store OTP with user_id
-      await withDbTimeout(
-        supabase.from("otps").insert({
-          user_id: user.id,
-          otp_code: otpCode,
-          otp_type: "login_2fa",
-          expires_at: expiresAt,
-          is_used: false,
-        }),
+          .select("id, session_id, device_name, session_token")
+          .eq("user_id", user.id)
+          .eq("is_active", true),
       );
 
-      // Send email
-      await sendOTPEmail(user.email, otpCode, "2fa");
-
-      // Generate TEMPORARY token (short-lived, only for 2FA verification)
-      const tempToken = jwt.sign(
+      // STEP 2: Generate token with session info (MATCHES LOGIN FORMAT)
+      const token = jwt.sign(
         {
           userId: user.id,
           email: user.email,
           role: user.role,
-          tempAuth: true, // Flag to indicate this is a temporary token
-          purpose: "2fa_verification",
+          sessionId: sessionId,
+          sessionVersion: sessionVersion,
           issuedAt: Date.now(),
         },
         process.env.JWT_SECRET,
-        { expiresIn: "15m" }, // Short expiry for 2FA step
+        { expiresIn: process.env.JWT_EXPIRE || "7d" },
       );
 
-      return res.json({
-        requiresTwoFactor: true,
-        tempToken: tempToken,
-        userId: user.id,
-        message: "Verification code sent to your email",
-      });
-    }
+      const expiresAt = new Date();
+      expiresAt.setDate(expiresAt.getDate() + 7);
 
-    // ========== STRICT SESSION MANAGEMENT ==========
-    const deviceInfo = getDeviceInfo(req);
-    const sessionVersion = Math.floor(Date.now() / 1000);
-    const sessionId = generateSessionId();
-
-    // STEP 1: Get ALL existing active sessions for this user
-    const { data: existingSessions } = await withDbTimeout(
-      supabase
-        .from("user_sessions")
-        .select("id, session_id, device_name, session_token")
-        .eq("user_id", user.id)
-        .eq("is_active", true),
-    );
-
-    // STEP 2: Generate new token with session info
-    const token = jwt.sign(
-      {
-        userId: user.id,
-        email: user.email,
-        role: user.role,
-        sessionId: sessionId,
-        sessionVersion: sessionVersion,
-        issuedAt: Date.now(),
-      },
-      process.env.JWT_SECRET,
-      { expiresIn: process.env.JWT_EXPIRE || "7d" },
-    );
-
-    const expiresAt = new Date();
-    expiresAt.setDate(expiresAt.getDate() + 7);
-
-    // STEP 3: Insert the new session
-    const { error: sessionError } = await withDbTimeout(
-      supabase.from("user_sessions").insert({
-        user_id: user.id,
-        session_token: token,
-        session_id: sessionId,
-        device_fingerprint: deviceInfo.device_name,
-        device_name: deviceInfo.device_name,
-        ip_address: deviceInfo.ip_address,
-        user_agent: deviceInfo.user_agent,
-        expires_at: expiresAt.toISOString(),
-        is_active: true,
-        is_current: true,
-        session_version: sessionVersion,
-        created_at: new Date().toISOString(),
-        last_activity: new Date().toISOString(),
-      }),
-    );
-
-    if (sessionError) {
-      console.error("Session insert error:", sessionError);
-    }
-
-    // STEP 4: Update user record with new active session
-    await withDbTimeout(
-      supabase
-        .from("users")
-        .update({
-          active_session_id: sessionId,
-          last_active_device: deviceInfo.device_name,
-          active_session_started_at: new Date().toISOString(),
-          last_login: new Date().toISOString(),
+      // STEP 3: Insert the new session (MATCHES LOGIN)
+      const { error: sessionError } = await withDbTimeout(
+        supabase.from("user_sessions").insert({
+          user_id: user.id,
+          session_token: token,
+          session_id: sessionId,
+          device_fingerprint: deviceInfo.device_name,
+          device_name: deviceInfo.device_name,
+          ip_address: deviceInfo.ip_address,
+          user_agent: deviceInfo.user_agent,
+          expires_at: expiresAt.toISOString(),
+          is_active: true,
+          is_current: true,
           session_version: sessionVersion,
-        })
-        .eq("id", user.id),
-    );
-
-    // STEP 5: Invalidate ALL existing sessions (excluding the new one)
-    if (existingSessions && existingSessions.length > 0) {
-      console.log(
-        `Invalidating ${existingSessions.length} old session(s) for user ${user.id}`,
+          created_at: new Date().toISOString(),
+          last_activity: new Date().toISOString(),
+        }),
       );
 
-      // Get the IDs of sessions to invalidate
-      const oldSessionIds = existingSessions.map((s) => s.id);
+      if (sessionError) {
+        console.error(
+          "Session insert error during registration:",
+          sessionError,
+        );
+        // Don't fail registration, just log it
+      }
 
+      // STEP 4: Update user record with active session (MATCHES LOGIN)
       await withDbTimeout(
         supabase
-          .from("user_sessions")
+          .from("users")
           .update({
-            is_active: false,
-            is_current: false,
-            invalidated_reason: `New login from ${deviceInfo.device_name}`,
-            expires_at: new Date().toISOString(),
+            active_session_id: sessionId,
+            last_active_device: deviceInfo.device_name,
+            active_session_started_at: new Date().toISOString(),
+            last_login: new Date().toISOString(),
+            session_version: sessionVersion,
           })
-          .in("id", oldSessionIds),
+          .eq("id", user.id),
       );
 
-      // Send notifications for each old session
-      for (const oldSession of existingSessions) {
+      // STEP 5: Invalidate any existing sessions (should be none, but safe)
+      if (existingSessions && existingSessions.length > 0) {
+        console.log(
+          `Invalidating ${existingSessions.length} existing session(s) for new user ${user.id}`,
+        );
+
+        await withDbTimeout(
+          supabase
+            .from("user_sessions")
+            .update({
+              is_active: false,
+              is_current: false,
+              invalidated_reason: `New registration from ${deviceInfo.device_name}`,
+              expires_at: new Date().toISOString(),
+            })
+            .in(
+              "id",
+              existingSessions.map((s) => s.id),
+            ),
+        );
+      }
+
+      // STEP 6: Log successful registration
+      await logSecurityEvent(user.id, "user_registered", {
+        ip: req.ip,
+        device: deviceInfo.device_name,
+        session_id: sessionId,
+      });
+
+      // Kick off virtual account creation immediately, without making the
+      // user wait for Flutterwave. On Vercel's Node.js runtime, a plain
+      // fire-and-forget async call can be killed the instant the response
+      // is sent, so this uses waitUntil() to keep the function alive until
+      // the job attempt finishes (requires `npm install @vercel/functions`).
+      // If this attempt fails for any reason, the cron sweep in
+      // virtual-account-worker.js retries it on the normal backoff schedule
+      // — registration success never depends on this succeeding.
+      if (enqueuedJobId) {
         try {
-          await withDbTimeout(
-            supabase.from("notifications").insert({
-              user_id: user.id,
-              title: "New Device Login",
-              message: `Your account was accessed from: ${deviceInfo.device_name}. Your session on ${oldSession.device_name || "another device"} was terminated. If this wasn't you, log in and change your password immediately.`,
-              type: "security",
-              created_at: new Date().toISOString(),
-            }),
-          );
-        } catch (err) {
-          console.error("Notification error:", err);
-          // Don't throw - notification failure shouldn't break login
+          const { waitUntil } = require("@vercel/functions");
+          waitUntil(virtualAccountWorker.processOne(enqueuedJobId));
+        } catch (waitUntilErr) {
+          // @vercel/functions not installed / not running on Vercel — fall
+          // back to plain fire-and-forget; the cron sweep still covers it.
+          virtualAccountWorker
+            .processOne(enqueuedJobId)
+            .catch((e) => console.error("processOne fallback failed:", e));
         }
       }
+
+      // Return response with token and session info
+      res.status(201).json({
+        message: "User created successfully",
+        token: token,
+        session: {
+          id: sessionId,
+          device: deviceInfo.device_name,
+          logged_in_at: new Date().toISOString(),
+        },
+        user: {
+          id: user.id,
+          email: user.email,
+          first_name: user.first_name,
+          last_name: user.last_name,
+          middle_name: user.middle_name,
+          role: user.role,
+          phone: user.phone,
+          country: user.country,
+          state: user.state,
+          city: user.city,
+          age: user.age,
+          gender: user.gender,
+          marital_status: user.marital_status,
+          occupation: user.occupation,
+          has_passcode: !!user.passcode_hash,
+          face_verified: user.face_verified,
+          face_images_count: face_images ? face_images.length : 0,
+        },
+      });
+    } catch (error) {
+      console.error("Registration error:", error);
+      res.status(500).json({ error: "Registration failed: " + error.message });
     }
+  },
+);
 
-    // Log successful login
-    await logSecurityEvent(user.id, "successful_login", {
-      ip,
-      fingerprint,
-      device: deviceInfo.device_name,
-      session_id: sessionId,
-    });
+// In index.js - REPLACE the login endpoint with this stricter version
 
-    res.json({
-      token,
-      user: {
-        id: user.id,
-        email: user.email,
-        first_name: user.first_name,
-        last_name: user.last_name,
-        role: user.role,
-        admin_role: user.admin_role,
-        admin_permissions: user.admin_permissions,
-        is_frozen: user.is_frozen,
-        kyc_status: user.kyc_status,
-      },
-      session: {
-        id: sessionId,
+app.post(
+  "/api/auth/login",
+  authLimiter,
+  validate(schemas.login),
+  async (req, res) => {
+    try {
+      const { email, password, fingerprint } = req.body;
+      const ip = req.ip;
+
+      // Failed attempts check (keep your existing code)
+      const attemptsKey = `${ip}:${email}`;
+      const attempts = failedAttempts.get(attemptsKey) || {
+        count: 0,
+        firstAttempt: Date.now(),
+      };
+
+      if (Date.now() - attempts.firstAttempt > 15 * 60 * 1000) {
+        attempts.count = 0;
+        attempts.firstAttempt = Date.now();
+      }
+
+      if (attempts.count >= 5) {
+        return res.status(429).json({
+          error: "Too many failed attempts. Account temporarily locked.",
+        });
+      }
+
+      // Fetch user
+      const { data: user, error } = await withDbTimeout(
+        supabase.from("users").select("*").eq("email", email).single(),
+      );
+
+      if (error || !user) {
+        attempts.count++;
+        failedAttempts.set(attemptsKey, attempts);
+        return res.status(401).json({ error: "Invalid credentials" });
+      }
+
+      // Password check
+      const validPassword = await bcrypt.compare(password, user.password_hash);
+      if (!validPassword) {
+        attempts.count++;
+        failedAttempts.set(attemptsKey, attempts);
+        await logSecurityEvent(user.id, "failed_login", { ip, fingerprint });
+        return res.status(401).json({ error: "Invalid credentials" });
+      }
+
+      // Account status checks
+      if (!user.is_active) {
+        return res.status(403).json({ error: "Account is deactivated" });
+      }
+
+      if (user.is_frozen) {
+        return res.status(403).json({
+          error: "Account frozen",
+          freeze_reason: user.freeze_reason,
+          unfreeze_method: user.unfreeze_method,
+        });
+      }
+
+      // Clear failed attempts
+      failedAttempts.delete(attemptsKey);
+
+      // ========== CHECK IF 2FA IS ENABLED ==========
+      if (user.two_factor_enabled) {
+        // Generate OTP
+        const otpCode = crypto.randomInt(100000, 1000000).toString(); // SECURITY FIX: cryptographically secure OTP
+        const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
+
+        // Store OTP with user_id
+        await withDbTimeout(
+          supabase.from("otps").insert({
+            user_id: user.id,
+            otp_code: otpCode,
+            otp_type: "login_2fa",
+            expires_at: expiresAt,
+            is_used: false,
+          }),
+        );
+
+        // Send email
+        await sendOTPEmail(user.email, otpCode, "2fa");
+
+        // Generate TEMPORARY token (short-lived, only for 2FA verification)
+        const tempToken = jwt.sign(
+          {
+            userId: user.id,
+            email: user.email,
+            role: user.role,
+            tempAuth: true, // Flag to indicate this is a temporary token
+            purpose: "2fa_verification",
+            issuedAt: Date.now(),
+          },
+          process.env.JWT_SECRET,
+          { expiresIn: "15m" }, // Short expiry for 2FA step
+        );
+
+        return res.json({
+          requiresTwoFactor: true,
+          tempToken: tempToken,
+          userId: user.id,
+          message: "Verification code sent to your email",
+        });
+      }
+
+      // ========== STRICT SESSION MANAGEMENT ==========
+      const deviceInfo = getDeviceInfo(req);
+      const sessionVersion = Math.floor(Date.now() / 1000);
+      const sessionId = generateSessionId();
+
+      // STEP 1: Get ALL existing active sessions for this user
+      const { data: existingSessions } = await withDbTimeout(
+        supabase
+          .from("user_sessions")
+          .select("id, session_id, device_name, session_token")
+          .eq("user_id", user.id)
+          .eq("is_active", true),
+      );
+
+      // STEP 2: Generate new token with session info
+      const token = jwt.sign(
+        {
+          userId: user.id,
+          email: user.email,
+          role: user.role,
+          sessionId: sessionId,
+          sessionVersion: sessionVersion,
+          issuedAt: Date.now(),
+        },
+        process.env.JWT_SECRET,
+        { expiresIn: process.env.JWT_EXPIRE || "7d" },
+      );
+
+      const expiresAt = new Date();
+      expiresAt.setDate(expiresAt.getDate() + 7);
+
+      // STEP 3: Insert the new session
+      const { error: sessionError } = await withDbTimeout(
+        supabase.from("user_sessions").insert({
+          user_id: user.id,
+          session_token: token,
+          session_id: sessionId,
+          device_fingerprint: deviceInfo.device_name,
+          device_name: deviceInfo.device_name,
+          ip_address: deviceInfo.ip_address,
+          user_agent: deviceInfo.user_agent,
+          expires_at: expiresAt.toISOString(),
+          is_active: true,
+          is_current: true,
+          session_version: sessionVersion,
+          created_at: new Date().toISOString(),
+          last_activity: new Date().toISOString(),
+        }),
+      );
+
+      if (sessionError) {
+        console.error("Session insert error:", sessionError);
+      }
+
+      // STEP 4: Update user record with new active session
+      await withDbTimeout(
+        supabase
+          .from("users")
+          .update({
+            active_session_id: sessionId,
+            last_active_device: deviceInfo.device_name,
+            active_session_started_at: new Date().toISOString(),
+            last_login: new Date().toISOString(),
+            session_version: sessionVersion,
+          })
+          .eq("id", user.id),
+      );
+
+      // STEP 5: Invalidate ALL existing sessions (excluding the new one)
+      if (existingSessions && existingSessions.length > 0) {
+        console.log(
+          `Invalidating ${existingSessions.length} old session(s) for user ${user.id}`,
+        );
+
+        // Get the IDs of sessions to invalidate
+        const oldSessionIds = existingSessions.map((s) => s.id);
+
+        await withDbTimeout(
+          supabase
+            .from("user_sessions")
+            .update({
+              is_active: false,
+              is_current: false,
+              invalidated_reason: `New login from ${deviceInfo.device_name}`,
+              expires_at: new Date().toISOString(),
+            })
+            .in("id", oldSessionIds),
+        );
+
+        // Send notifications for each old session
+        for (const oldSession of existingSessions) {
+          try {
+            await withDbTimeout(
+              supabase.from("notifications").insert({
+                user_id: user.id,
+                title: "New Device Login",
+                message: `Your account was accessed from: ${deviceInfo.device_name}. Your session on ${oldSession.device_name || "another device"} was terminated. If this wasn't you, log in and change your password immediately.`,
+                type: "security",
+                created_at: new Date().toISOString(),
+              }),
+            );
+          } catch (err) {
+            console.error("Notification error:", err);
+            // Don't throw - notification failure shouldn't break login
+          }
+        }
+      }
+
+      // Log successful login
+      await logSecurityEvent(user.id, "successful_login", {
+        ip,
+        fingerprint,
         device: deviceInfo.device_name,
-        logged_in_at: new Date().toISOString(),
-      },
-    });
-  } catch (error) {
-    console.error("Login error:", error);
-    res.status(500).json({ error: "Login failed: " + error.message });
-  }
-});
+        session_id: sessionId,
+      });
+
+      res.json({
+        token,
+        user: {
+          id: user.id,
+          email: user.email,
+          first_name: user.first_name,
+          last_name: user.last_name,
+          role: user.role,
+          admin_role: user.admin_role,
+          admin_permissions: user.admin_permissions,
+          is_frozen: user.is_frozen,
+          kyc_status: user.kyc_status,
+        },
+        session: {
+          id: sessionId,
+          device: deviceInfo.device_name,
+          logged_in_at: new Date().toISOString(),
+        },
+      });
+    } catch (error) {
+      console.error("Login error:", error);
+      res.status(500).json({ error: "Login failed: " + error.message });
+    }
+  },
+);
 
 // ==================== THEME PREFERENCE ROUTES ====================
 
@@ -6064,7 +5835,7 @@ app.get(
         to_user: rawTransaction.to_user || null,
       };
 
-            // Bill-payment transactions carry secret data (electricity
+      // Bill-payment transactions carry secret data (electricity
       // token, exam PIN, etc.) on bill_transactions, joined via the
       // shared transaction_reference — transactions_new has no such
       // column itself. Attached as transaction.bill so the frontend
@@ -7733,8 +7504,6 @@ app.get("/api/accounts/recipient", authenticate, async (req, res) => {
   }
 });
 
-
-
 // Verify OTP and complete transaction
 app.post("/api/user/verify-otp", authenticate, async (req, res) => {
   try {
@@ -7860,10 +7629,7 @@ app.post(
       // card-fraud risk. crypto.randomInt is CSPRNG-backed.
       const cardNumber =
         "4" +
-        crypto
-          .randomInt(0, 1000000000000000)
-          .toString()
-          .padStart(15, "0");
+        crypto.randomInt(0, 1000000000000000).toString().padStart(15, "0");
       const expiryDate = new Date();
       expiryDate.setFullYear(expiryDate.getFullYear() + 3);
       const cvv = crypto.randomInt(100, 1000).toString();
@@ -8002,20 +7768,12 @@ app.post(
         .eq("user_id", req.user.id);
 
       // Create support ticket
-      const { data: ticket } = await supabase
-        .from("support_tickets")
-        .insert({
-          user_id: req.user.id,
-          subject: "Lost/Stolen Card Report",
-          message: `Card ID: ${cardId} reported as lost/stolen`,
-          priority: "high",
-        })
-        .select()
-        .single();
-
-      res.json({
-        message: "Card reported successfully. Support ticket created.",
-        ticket,
+      const { data: ticket } = await supabase.from("notifications").insert({
+        user_id: req.user.id,
+        title: "Card Reported Lost/Stolen",
+        message:
+          "Your card has been reported as lost/stolen. A new card will be issued. Open Support Chat if you need anything else.",
+        type: "danger",
       });
     } catch (error) {
       console.error("Card report error:", error);
@@ -8035,172 +7793,6 @@ app.get("/api/user/beneficiaries/recent", authenticate, async (req, res) => {
     res.status(500).json({ error: "Failed to fetch beneficiaries" });
   }
 });
-
-// =========================Bills Sections =========================
-// Get bills
-/*app.get(
-  "/api/user/bills",
-  authenticate,
-  checkAccountFrozen,
-  async (req, res) => {
-    try {
-      const { data: bills, error } = await supabase
-        .from("bills")
-        .select("*")
-        .eq("user_id", req.user.id);
-
-      if (error) throw error;
-
-      res.json(bills);
-    } catch (error) {
-      console.error("Bills fetch error:", error);
-      res.status(500).json({ error: "Failed to fetch bills" });
-    }
-  },
-);
-
-// Add bill
-app.post(
-  "/api/user/bills",
-  authenticate,
-  checkAccountFrozen,
-  async (req, res) => {
-    try {
-      const {
-        biller_name,
-        biller_account,
-        category,
-        amount,
-        due_date,
-        is_recurring,
-        recurring_frequency,
-      } = req.body;
-
-      const { data: bill, error } = await supabase
-        .from("bills")
-        .insert({
-          user_id: req.user.id,
-          biller_name,
-          biller_account,
-          category,
-          amount,
-          due_date,
-          is_recurring,
-          recurring_frequency,
-        })
-        .select()
-        .single();
-
-      if (error) throw error;
-
-      res.json({ message: "Bill added successfully", bill });
-    } catch (error) {
-      console.error("Add bill error:", error);
-      res.status(500).json({ error: "Failed to add bill" });
-    }
-  },
-);*/
-
-// Pay bill
-/*app.post(
-  "/api/user/pay-bill/:billId",
-  authenticate,
-  checkAccountFrozen,
-  async (req, res) => {
-    try {
-      const { billId } = req.params;
-      const { account_id } = req.body;
-
-      // Get bill
-      const { data: bill } = await supabase
-        .from("bills")
-        .select("*")
-        .eq("id", billId)
-        .eq("user_id", req.user.id)
-        .single();
-
-      if (!bill) {
-        return res.status(404).json({ error: "Bill not found" });
-      }
-
-      // Get account
-      const { data: account } = await supabase
-        .from("accounts")
-        .select("*")
-        .eq("id", account_id)
-        .eq("user_id", req.user.id)
-        .single();
-
-      if (!account) {
-        return res.status(404).json({ error: "Account not found" });
-      }
-
-      if (account.available_balance < bill.amount) {
-        return res.status(400).json({ error: "Insufficient funds" });
-      }
-
-      // Create transaction
-      const { data: transaction } = await supabase
-        .from("transactions_new")
-        .insert({
-          from_account_id: account_id,
-          from_user_id: req.user.id,
-          amount: bill.amount,
-          description: `Bill payment to ${bill.biller_name}`,
-          transaction_type: "bill_payment",
-          status: "completed",
-          completed_at: new Date(),
-        })
-        .select()
-        .single();
-
-      // Update account balance
-      await supabase
-        .from("accounts")
-        .update({
-          balance: account.balance - bill.amount,
-          available_balance: account.available_balance - bill.amount,
-        })
-        .eq("id", account_id);
-
-      // Update bill status
-      await supabase.from("bills").update({ status: "paid" }).eq("id", billId);
-
-      // If recurring, create next bill
-      if (bill.is_recurring) {
-        let nextDueDate = new Date(bill.due_date);
-        switch (bill.recurring_frequency) {
-          case "monthly":
-            nextDueDate.setMonth(nextDueDate.getMonth() + 1);
-            break;
-          case "quarterly":
-            nextDueDate.setMonth(nextDueDate.getMonth() + 3);
-            break;
-          case "yearly":
-            nextDueDate.setFullYear(nextDueDate.getFullYear() + 1);
-            break;
-        }
-
-        await supabase.from("bills").insert({
-          user_id: req.user.id,
-          biller_name: bill.biller_name,
-          biller_account: bill.biller_account,
-          category: bill.category,
-          amount: bill.amount,
-          due_date: nextDueDate,
-          is_recurring: true,
-          recurring_frequency: bill.recurring_frequency,
-          status: "pending",
-        });
-      }
-
-      res.json({ message: "Bill paid successfully", transaction });
-    } catch (error) {
-      console.error("Pay bill error:", error);
-      res.status(500).json({ error: "Failed to pay bill" });
-    }
-  },
-);*/
 
 const billsService = require("../lib/bills-service");
 const billsWorker = require("../lib/bills-worker");
@@ -8223,7 +7815,7 @@ app.post(
   billsService.billPaymentLimiter,
   billsService.handleCreateBillPayment,
 );
-app.get("/api/cron/process-bills", billsWorker.cronHandler); 
+app.get("/api/cron/process-bills", billsWorker.cronHandler);
 
 app.get(
   "/api/user/bills/:id/status",
@@ -8360,127 +7952,6 @@ app.post(
     } catch (error) {
       console.error("Budget save error:", error);
       res.status(500).json({ error: "Failed to save budget" });
-    }
-  },
-);
-
-// Get support tickets
-app.get("/api/user/tickets", authenticate, async (req, res) => {
-  try {
-    const { data: tickets, error } = await supabase
-      .from("support_tickets")
-      .select("*")
-      .eq("user_id", req.user.id)
-      .order("created_at", { ascending: false });
-
-    if (error) throw error;
-
-    res.json(tickets);
-  } catch (error) {
-    console.error("Tickets fetch error:", error);
-    res.status(500).json({ error: "Failed to fetch tickets" });
-  }
-});
-
-// Create support ticket
-app.post("/api/user/tickets", authenticate, async (req, res) => {
-  try {
-    const { subject, message, priority = "medium" } = req.body;
-
-    const { data: ticket, error } = await supabase
-      .from("support_tickets")
-      .insert({
-        user_id: req.user.id,
-        subject,
-        message,
-        priority,
-      })
-      .select()
-      .single();
-
-    if (error) throw error;
-
-    res.json({ message: "Ticket created successfully", ticket });
-  } catch (error) {
-    console.error("Ticket creation error:", error);
-    res.status(500).json({ error: "Failed to create ticket" });
-  }
-});
-
-// Get chat messages for ticket
-app.get(
-  "/api/user/tickets/:ticketId/messages",
-  authenticate,
-  async (req, res) => {
-    try {
-      const { ticketId } = req.params;
-
-      // Verify ticket belongs to user
-      const { data: ticket } = await supabase
-        .from("support_tickets")
-        .select("id")
-        .eq("id", ticketId)
-        .eq("user_id", req.user.id)
-        .single();
-
-      if (!ticket) {
-        return res.status(404).json({ error: "Ticket not found" });
-      }
-
-      const { data: messages, error } = await supabase
-        .from("chat_messages")
-        .select("*, sender:sender_id(first_name, last_name, role)")
-        .eq("ticket_id", ticketId)
-        .order("created_at", { ascending: true });
-
-      if (error) throw error;
-
-      res.json(messages);
-    } catch (error) {
-      console.error("Messages fetch error:", error);
-      res.status(500).json({ error: "Failed to fetch messages" });
-    }
-  },
-);
-
-// Send chat message
-app.post(
-  "/api/user/tickets/:ticketId/messages",
-  authenticate,
-  async (req, res) => {
-    try {
-      const { ticketId } = req.params;
-      const { message } = req.body;
-
-      // Verify ticket belongs to user
-      const { data: ticket } = await supabase
-        .from("support_tickets")
-        .select("id")
-        .eq("id", ticketId)
-        .eq("user_id", req.user.id)
-        .single();
-
-      if (!ticket) {
-        return res.status(404).json({ error: "Ticket not found" });
-      }
-
-      const { data: chatMessage, error } = await supabase
-        .from("chat_messages")
-        .insert({
-          ticket_id: ticketId,
-          sender_id: req.user.id,
-          message,
-          is_admin_reply: false,
-        })
-        .select()
-        .single();
-
-      if (error) throw error;
-
-      res.json({ message: "Message sent successfully", chatMessage });
-    } catch (error) {
-      console.error("Message send error:", error);
-      res.status(500).json({ error: "Failed to send message" });
     }
   },
 );
@@ -9119,37 +8590,24 @@ app.post(
         });
       }
 
-      // Create withdrawal request in chat
-      const { data: ticket } = await supabase
-        .from("support_tickets")
-        .insert({
-          user_id: req.user.id,
-          subject: "OTP Request for Withdrawal",
-          message: JSON.stringify({
-            type: "otp_request",
-            action: "withdrawal",
-            amount,
-            account_id,
-            bank_details,
-          }),
-          priority: "high",
-          status: "open",
-        })
-        .select()
-        .single();
+      // Create withdrawal request in notification
+      await supabase.from("notifications").insert({
+        user_id: req.user.id,
+        title: "Withdrawal review requested",
+        message: `Your withdrawal of ${amount} needs a one-time review before it can be released. Open Support Chat and select "I need my withdrawal OTP code" so a team member can help.`,
+        type: "info",
+      });
 
-      // Send auto-reply with OTP request instructions
-      await supabase.from("chat_messages").insert({
-        ticket_id: ticket.id,
-        sender_id: req.user.id,
-        message: "I need an OTP code for withdrawal",
-        is_admin_reply: false,
+      await supabase.from("admin_actions").insert({
+        admin_id: null,
+        action_type: "withdrawal_otp_requested",
+        target_user_id: req.user.id,
+        details: { amount, account_id },
       });
 
       res.json({
-        message: "OTP request sent. Please check chat for OTP code.",
+        message: "Please open Support Chat to complete OTP verification.",
         requires_otp: true,
-        ticket_id: ticket.id,
       });
     } catch (error) {
       console.error("OTP request error:", error);
@@ -10760,7 +10218,6 @@ app.post(
   },
 );
 
-
 // Cancel savings plan (stop auto-save but keep saved amount)
 app.post(
   "/api/user/savings/:type/:id/cancel",
@@ -11032,7 +10489,7 @@ app.post(
 
       // Create notification for user
       //await supabase.from("notifications").insert
-      await notifyAndPush ({
+      await notifyAndPush({
         user_id: req.user.id,
         title: "Add-Up Contribution Successful",
         message: `You added ₦${amount.toLocaleString()} to your ${enrollment.harvest_plans.name} plan. ${additionalDays} days of savings added!`,
@@ -11168,32 +10625,15 @@ app.post("/api/user/request-unfreeze-otp", authenticate, async (req, res) => {
     const { unfreeze_method, unfreeze_payment_details } = req.user;
 
     if (unfreeze_method === "support") {
-      // Create a support ticket and redirect to live support
-      const { data: ticket, error } = await supabase
-        .from("support_tickets")
-        .insert({
-          user_id: req.user.id,
-          subject: "Account Unfreeze Request",
-          message: `My account is frozen. Reason: ${req.user.freeze_reason || "Not specified"}. Please assist me in unfreezing it.`,
-          priority: "high",
-        })
-        .select()
-        .single();
-
-      if (error) throw error;
-
-      // Send an auto‑reply to start the chat
-      await supabase.from("chat_messages").insert({
-        ticket_id: ticket.id,
-        sender_id: req.user.id,
-        message: "I need help to unfreeze my account.",
-        is_admin_reply: false,
+      await supabase.from("notifications").insert({
+        user_id: req.user.id,
+        title: "Account unfreeze requested",
+        message: `Your account is frozen (${req.user.freeze_reason || "reason not specified"}). Open Support Chat and select "My account is frozen" — our team will help you get unfrozen.`,
+        type: "warning",
       });
-
       return res.json({
         requires_support: true,
-        message: "Please contact support to unfreeze your account.",
-        ticket_id: ticket.id,
+        message: "Please open Support Chat to continue.",
       });
     }
 
@@ -11258,7 +10698,7 @@ app.post("/api/user/verify-unfreeze-otp", authenticate, async (req, res) => {
 
     // Create notification
     //await supabase.from("notifications").insert
-    await notifyAndPush ({
+    await notifyAndPush({
       user_id: req.user.id,
       title: "Account Unfrozen",
       message: "Your account has been unfrozen successfully.",
@@ -11271,67 +10711,6 @@ app.post("/api/user/verify-unfreeze-otp", authenticate, async (req, res) => {
     res.status(500).json({ error: "Failed to unfreeze account" });
   }
 });
-
-// ────────────────────────────────────────────────
-//     LIVE SUPPORT / CHAT ROUTES (minimal version)
-// ────────────────────────────────────────────────
-// ==================== LIVE SUPPORT CHAT ROUTES ====================
-
-// USER SIDE - Get own chat history
-app.get("/api/chat/live", authenticate, async (req, res) => {
-  try {
-    const { data, error } = await supabase
-      .from("live_support_messages")
-      .select(
-        `
-        id,
-        message,
-        is_from_admin,
-        status,
-        created_at
-      `,
-      )
-      .eq("user_id", req.user.id)
-      .order("created_at", { ascending: true });
-
-    if (error) throw error;
-
-    res.json({ messages: data || [] });
-  } catch (error) {
-    console.error("Live chat GET error:", error);
-    res.status(500).json({ error: "Failed to load chat history" });
-  }
-});
-
-// USER SIDE - Send message
-app.post("/api/chat/live", authenticate, async (req, res) => {
-  try {
-    const { message } = req.body;
-    if (!message || !message.trim()) {
-      return res.status(400).json({ error: "Message cannot be empty" });
-    }
-
-    const { data, error } = await supabase
-      .from("live_support_messages")
-      .insert({
-        user_id: req.user.id,
-        message: message.trim(),
-        is_from_admin: false,
-        status: "sent",
-      })
-      .select()
-      .single();
-
-    if (error) throw error;
-
-    res.json({ success: true, message: data });
-  } catch (error) {
-    console.error("Live chat POST error:", error);
-    res.status(500).json({ error: "Failed to send message" });
-  }
-});
-
-
 
 // ============================================================
 // UPDATED LEDGER API ENDPOINTS - Add to index.js
@@ -13681,35 +13060,40 @@ app.get("/api/user/has-pin", authenticate, async (req, res) => {
 });
 
 // Set/Update transfer PIN
-app.post("/api/user/set-transfer-pin", authenticate, validate(schemas.setTransferPin), async (req, res) => {
-  try {
-    const { pin } = req.body;
+app.post(
+  "/api/user/set-transfer-pin",
+  authenticate,
+  validate(schemas.setTransferPin),
+  async (req, res) => {
+    try {
+      const { pin } = req.body;
 
-    if (!pin || pin.length !== 4 || !/^\d{4}$/.test(pin)) {
-      return res.status(400).json({ error: "PIN must be exactly 4 digits" });
+      if (!pin || pin.length !== 4 || !/^\d{4}$/.test(pin)) {
+        return res.status(400).json({ error: "PIN must be exactly 4 digits" });
+      }
+
+      // Hash the PIN before storing
+      const hashedPin = await bcrypt.hash(pin, 10);
+
+      const { error } = await supabase
+        .from("users")
+        .update({
+          transfer_pin: hashedPin,
+          transfer_pin_set_at: new Date(),
+          pin_attempts: 0,
+          last_pin_attempt: null,
+        })
+        .eq("id", req.user.id);
+
+      if (error) throw error;
+
+      res.json({ success: true, message: "Transfer PIN set successfully" });
+    } catch (error) {
+      console.error("Set PIN error:", error);
+      res.status(500).json({ error: "Failed to set transfer PIN" });
     }
-
-    // Hash the PIN before storing
-    const hashedPin = await bcrypt.hash(pin, 10);
-
-    const { error } = await supabase
-      .from("users")
-      .update({
-        transfer_pin: hashedPin,
-        transfer_pin_set_at: new Date(),
-        pin_attempts: 0,
-        last_pin_attempt: null,
-      })
-      .eq("id", req.user.id);
-
-    if (error) throw error;
-
-    res.json({ success: true, message: "Transfer PIN set successfully" });
-  } catch (error) {
-    console.error("Set PIN error:", error);
-    res.status(500).json({ error: "Failed to set transfer PIN" });
-  }
-});
+  },
+);
 
 // Verify transfer PIN
 /*app.post("/api/user/verify-transfer-pin", authenticate, async (req, res) => {
@@ -13783,99 +13167,105 @@ app.post("/api/user/set-transfer-pin", authenticate, validate(schemas.setTransfe
   }
 });*/
 
-app.post("/api/user/verify-transfer-pin", authenticate, pinVerifyLimiter, validate(schemas.verifyTransferPin), async (req, res) => {
-  try {
-    const { pin, from_account_id, to_account_number, amount } = req.body;
+app.post(
+  "/api/user/verify-transfer-pin",
+  authenticate,
+  pinVerifyLimiter,
+  validate(schemas.verifyTransferPin),
+  async (req, res) => {
+    try {
+      const { pin, from_account_id, to_account_number, amount } = req.body;
 
-    if (!pin || pin.length !== 4) {
-      return res
-        .status(400)
-        .json({ valid: false, error: "Invalid PIN format" });
-    }
-    if (!from_account_id || !to_account_number || !amount) {
-      return res.status(400).json({
-        valid: false,
-        error: "from_account_id, to_account_number, and amount are required",
-      });
-    }
-
-    const { data: user, error } = await supabase
-      .from("users")
-      .select("transfer_pin, pin_attempts, last_pin_attempt")
-      .eq("id", req.user.id)
-      .single();
-
-    if (error) throw error;
-
-    if (!user.transfer_pin) {
-      return res.json({ valid: false, needs_setup: true });
-    }
-
-    if (user.pin_attempts >= 4) {
-      return res.status(403).json({
-        valid: false,
-        frozen: true,
-        error: "Too many incorrect PIN attempts. Account frozen.",
-      });
-    }
-
-    const isValid = await bcrypt.compare(pin, user.transfer_pin);
-
-    if (!isValid) {
-      const newAttempts = (user.pin_attempts || 0) + 1;
-      const updates = {
-        pin_attempts: newAttempts,
-        last_pin_attempt: new Date(),
-      };
-
-      if (newAttempts >= 4) {
-        updates.is_frozen = true;
-        updates.freeze_reason =
-          "Too many incorrect PIN attempts - Contact support to unfreeze";
-        updates.unfreeze_method = "support";
+      if (!pin || pin.length !== 4) {
+        return res
+          .status(400)
+          .json({ valid: false, error: "Invalid PIN format" });
+      }
+      if (!from_account_id || !to_account_number || !amount) {
+        return res.status(400).json({
+          valid: false,
+          error: "from_account_id, to_account_number, and amount are required",
+        });
       }
 
-      await supabase.from("users").update(updates).eq("id", req.user.id);
+      const { data: user, error } = await supabase
+        .from("users")
+        .select("transfer_pin, pin_attempts, last_pin_attempt")
+        .eq("id", req.user.id)
+        .single();
 
-      return res.json({
-        valid: false,
-        attempts_remaining: 4 - newAttempts,
-        frozen: newAttempts >= 4,
-      });
+      if (error) throw error;
+
+      if (!user.transfer_pin) {
+        return res.json({ valid: false, needs_setup: true });
+      }
+
+      if (user.pin_attempts >= 4) {
+        return res.status(403).json({
+          valid: false,
+          frozen: true,
+          error: "Too many incorrect PIN attempts. Account frozen.",
+        });
+      }
+
+      const isValid = await bcrypt.compare(pin, user.transfer_pin);
+
+      if (!isValid) {
+        const newAttempts = (user.pin_attempts || 0) + 1;
+        const updates = {
+          pin_attempts: newAttempts,
+          last_pin_attempt: new Date(),
+        };
+
+        if (newAttempts >= 4) {
+          updates.is_frozen = true;
+          updates.freeze_reason =
+            "Too many incorrect PIN attempts - Contact support to unfreeze";
+          updates.unfreeze_method = "support";
+        }
+
+        await supabase.from("users").update(updates).eq("id", req.user.id);
+
+        return res.json({
+          valid: false,
+          attempts_remaining: 4 - newAttempts,
+          frozen: newAttempts >= 4,
+        });
+      }
+
+      // Correct PIN — reset attempts and mint a token bound to THIS exact
+      // transfer (same amount, same accounts). Expires in 2 minutes so a
+      // leaked token has a tiny window and can't sit around indefinitely.
+      await supabase
+        .from("users")
+        .update({ pin_attempts: 0, last_pin_attempt: null })
+        .eq("id", req.user.id);
+
+      const token = crypto.randomBytes(32).toString("hex");
+      const contextHash = hashTransferContext(
+        from_account_id,
+        to_account_number,
+        amount,
+      );
+
+      const { error: insertError } = await supabase
+        .from("transfer_authorizations")
+        .insert({
+          user_id: req.user.id,
+          token,
+          context_hash: contextHash,
+          expires_at: new Date(Date.now() + 2 * 60 * 1000).toISOString(),
+        });
+
+      if (insertError) throw insertError;
+
+      res.json({ valid: true, transfer_auth_token: token, expires_in: 120 });
+    } catch (error) {
+      console.error("Verify PIN error:", error);
+      res.status(500).json({ error: "PIN verification failed" });
     }
-
-    // Correct PIN — reset attempts and mint a token bound to THIS exact
-    // transfer (same amount, same accounts). Expires in 2 minutes so a
-    // leaked token has a tiny window and can't sit around indefinitely.
-    await supabase
-      .from("users")
-      .update({ pin_attempts: 0, last_pin_attempt: null })
-      .eq("id", req.user.id);
-
-    const token = crypto.randomBytes(32).toString("hex");
-    const contextHash = hashTransferContext(
-      from_account_id,
-      to_account_number,
-      amount,
-    );
-
-    const { error: insertError } = await supabase
-      .from("transfer_authorizations")
-      .insert({
-        user_id: req.user.id,
-        token,
-        context_hash: contextHash,
-        expires_at: new Date(Date.now() + 2 * 60 * 1000).toISOString(),
-      });
-
-    if (insertError) throw insertError;
-
-    res.json({ valid: true, transfer_auth_token: token, expires_in: 120 });
-  } catch (error) {
-    console.error("Verify PIN error:", error);
-    res.status(500).json({ error: "PIN verification failed" });
-  }
-});
+  },
+);
 
 // PIN verification for savings withdrawals. Deliberately separate from
 // /api/user/verify-transfer-pin above: that endpoint mints a token bound
@@ -13886,98 +13276,104 @@ app.post("/api/user/verify-transfer-pin", authenticate, pinVerifyLimiter, valida
 // PIN/attempts/freeze checks but binds its token to (user, savings type,
 // savings id) instead — used by both dashboard.js's built-in withdraw flow
 // and can be reused by any future savings withdrawal flow.
-app.post("/api/user/verify-savings-pin", authenticate, pinVerifyLimiter, validate(schemas.verifySavingsPin), async (req, res) => {
-  try {
-    const { pin, type, id } = req.body;
+app.post(
+  "/api/user/verify-savings-pin",
+  authenticate,
+  pinVerifyLimiter,
+  validate(schemas.verifySavingsPin),
+  async (req, res) => {
+    try {
+      const { pin, type, id } = req.body;
 
-    if (!pin || pin.length !== 4) {
-      return res
-        .status(400)
-        .json({ valid: false, error: "Invalid PIN format" });
-    }
-    if (!type || !id) {
-      return res.status(400).json({
-        valid: false,
-        error: "type and id are required",
-      });
-    }
-
-    const { data: user, error } = await supabase
-      .from("users")
-      .select("transfer_pin, pin_attempts, last_pin_attempt")
-      .eq("id", req.user.id)
-      .single();
-
-    if (error) throw error;
-
-    if (!user.transfer_pin) {
-      return res.json({ valid: false, needs_setup: true });
-    }
-
-    if (user.pin_attempts >= 4) {
-      return res.status(403).json({
-        valid: false,
-        frozen: true,
-        error: "Too many incorrect PIN attempts. Account frozen.",
-      });
-    }
-
-    const isValid = await bcrypt.compare(pin, user.transfer_pin);
-
-    if (!isValid) {
-      const newAttempts = (user.pin_attempts || 0) + 1;
-      const updates = {
-        pin_attempts: newAttempts,
-        last_pin_attempt: new Date(),
-      };
-
-      if (newAttempts >= 4) {
-        updates.is_frozen = true;
-        updates.freeze_reason =
-          "Too many incorrect PIN attempts - Contact support to unfreeze";
-        updates.unfreeze_method = "support";
+      if (!pin || pin.length !== 4) {
+        return res
+          .status(400)
+          .json({ valid: false, error: "Invalid PIN format" });
+      }
+      if (!type || !id) {
+        return res.status(400).json({
+          valid: false,
+          error: "type and id are required",
+        });
       }
 
-      await supabase.from("users").update(updates).eq("id", req.user.id);
+      const { data: user, error } = await supabase
+        .from("users")
+        .select("transfer_pin, pin_attempts, last_pin_attempt")
+        .eq("id", req.user.id)
+        .single();
 
-      return res.json({
-        valid: false,
-        attempts_remaining: 4 - newAttempts,
-        frozen: newAttempts >= 4,
-      });
+      if (error) throw error;
+
+      if (!user.transfer_pin) {
+        return res.json({ valid: false, needs_setup: true });
+      }
+
+      if (user.pin_attempts >= 4) {
+        return res.status(403).json({
+          valid: false,
+          frozen: true,
+          error: "Too many incorrect PIN attempts. Account frozen.",
+        });
+      }
+
+      const isValid = await bcrypt.compare(pin, user.transfer_pin);
+
+      if (!isValid) {
+        const newAttempts = (user.pin_attempts || 0) + 1;
+        const updates = {
+          pin_attempts: newAttempts,
+          last_pin_attempt: new Date(),
+        };
+
+        if (newAttempts >= 4) {
+          updates.is_frozen = true;
+          updates.freeze_reason =
+            "Too many incorrect PIN attempts - Contact support to unfreeze";
+          updates.unfreeze_method = "support";
+        }
+
+        await supabase.from("users").update(updates).eq("id", req.user.id);
+
+        return res.json({
+          valid: false,
+          attempts_remaining: 4 - newAttempts,
+          frozen: newAttempts >= 4,
+        });
+      }
+
+      // Correct PIN — reset attempts and mint a token bound to THIS exact
+      // savings withdrawal (same user, same type, same id). Expires in 2
+      // minutes, same window as transfer PIN tokens.
+      await supabase
+        .from("users")
+        .update({ pin_attempts: 0, last_pin_attempt: null })
+        .eq("id", req.user.id);
+
+      const token = crypto.randomBytes(32).toString("hex");
+      const contextHash = crypto
+        .createHash("sha256")
+        .update(`savings:${type}:${id}:${req.user.id}`)
+        .digest("hex");
+
+      const { error: insertError } = await supabase
+        .from("transfer_authorizations")
+        .insert({
+          user_id: req.user.id,
+          token,
+          context_hash: contextHash,
+          expires_at: new Date(Date.now() + 2 * 60 * 1000).toISOString(),
+        });
+
+      if (insertError) throw insertError;
+
+      res.json({ valid: true, savings_auth_token: token, expires_in: 120 });
+    } catch (error) {
+      console.error("Verify savings PIN error:", error);
+      res.status(500).json({ error: "PIN verification failed" });
     }
-
-    // Correct PIN — reset attempts and mint a token bound to THIS exact
-    // savings withdrawal (same user, same type, same id). Expires in 2
-    // minutes, same window as transfer PIN tokens.
-    await supabase
-      .from("users")
-      .update({ pin_attempts: 0, last_pin_attempt: null })
-      .eq("id", req.user.id);
-
-    const token = crypto.randomBytes(32).toString("hex");
-    const contextHash = crypto
-      .createHash("sha256")
-      .update(`savings:${type}:${id}:${req.user.id}`)
-      .digest("hex");
-
-    const { error: insertError } = await supabase
-      .from("transfer_authorizations")
-      .insert({
-        user_id: req.user.id,
-        token,
-        context_hash: contextHash,
-        expires_at: new Date(Date.now() + 2 * 60 * 1000).toISOString(),
-      });
-
-    if (insertError) throw insertError;
-
-    res.json({ valid: true, savings_auth_token: token, expires_in: 120 });
-  } catch (error) {
-    console.error("Verify savings PIN error:", error);
-    res.status(500).json({ error: "PIN verification failed" });
-  }
-});
+  },
+);
 
 // Freeze account due to PIN attempts
 app.post(
@@ -14454,95 +13850,100 @@ app.post(
 );
 
 // Verify staff ID during admin login
-app.post("/api/auth/verify-staff-id", staffIdLimiter, validate(schemas.verifyStaffId), async (req, res) => {
-  try {
-    const { userId, staff_id } = req.body;
+app.post(
+  "/api/auth/verify-staff-id",
+  staffIdLimiter,
+  validate(schemas.verifyStaffId),
+  async (req, res) => {
+    try {
+      const { userId, staff_id } = req.body;
 
-    if (!userId || !staff_id) {
-      return res.status(400).json({ error: "User ID and Staff ID required" });
-    }
+      if (!userId || !staff_id) {
+        return res.status(400).json({ error: "User ID and Staff ID required" });
+      }
 
-    // Get user
-    const { data: user, error: userError } = await supabase
-      .from("users")
-      .select(
-        "id, role, admin_staff_id, admin_staff_id_verified, email, first_name, last_name",
-      )
-      .eq("id", userId)
-      .single();
+      // Get user
+      const { data: user, error: userError } = await supabase
+        .from("users")
+        .select(
+          "id, role, admin_staff_id, admin_staff_id_verified, email, first_name, last_name",
+        )
+        .eq("id", userId)
+        .single();
 
-    if (userError || !user) {
-      return res.status(404).json({ error: "User not found" });
-    }
+      if (userError || !user) {
+        return res.status(404).json({ error: "User not found" });
+      }
 
-    // Super admin doesn't need staff ID
-    if (user.role === "super_admin") {
-      return res.json({
-        valid: true,
-        message: "Super admin verified",
-      });
-    }
+      // Super admin doesn't need staff ID
+      if (user.role === "super_admin") {
+        return res.json({
+          valid: true,
+          message: "Super admin verified",
+        });
+      }
 
-    // Check if user is admin
-    if (user.role !== "admin") {
-      return res.status(403).json({ error: "Not an admin account" });
-    }
+      // Check if user is admin
+      if (user.role !== "admin") {
+        return res.status(403).json({ error: "Not an admin account" });
+      }
 
-    // Verify staff ID
-    if (!user.admin_staff_id) {
-      return res.status(401).json({
-        valid: false,
-        error: "No staff ID assigned. Please contact super admin.",
-        needs_setup: true,
-      });
-    }
+      // Verify staff ID
+      if (!user.admin_staff_id) {
+        return res.status(401).json({
+          valid: false,
+          error: "No staff ID assigned. Please contact super admin.",
+          needs_setup: true,
+        });
+      }
 
-    const staffIdMatches = await bcrypt.compare(
-      String(staff_id),
-      user.admin_staff_id,
-    );
+      const staffIdMatches = await bcrypt.compare(
+        String(staff_id),
+        user.admin_staff_id,
+      );
 
-    if (!staffIdMatches) {
-      // Log failed attempt
+      if (!staffIdMatches) {
+        // Log failed attempt
+        await supabase.from("security_logs").insert({
+          user_id: userId,
+          event_type: "failed_staff_id_verification",
+          details: { ip: req.ip, user_agent: req.headers["user-agent"] },
+          ip_address: req.ip,
+          timestamp: new Date().toISOString(),
+        });
+
+        return res.status(401).json({
+          valid: false,
+          error: "Invalid staff ID",
+          attempts_remaining: 3,
+        });
+      }
+
+      // Mark as verified for this session
+      await supabase
+        .from("users")
+        .update({ admin_staff_id_verified: true })
+        .eq("id", userId);
+
+      // Log successful verification
       await supabase.from("security_logs").insert({
         user_id: userId,
-        event_type: "failed_staff_id_verification",
-        details: { ip: req.ip, user_agent: req.headers["user-agent"] },
+        event_type: "staff_id_verified",
+        details: { ip: req.ip },
         ip_address: req.ip,
         timestamp: new Date().toISOString(),
       });
 
-      return res.status(401).json({
-        valid: false,
-        error: "Invalid staff ID",
-        attempts_remaining: 3,
+      res.json({
+        valid: true,
+        message: "Staff ID verified successfully",
       });
+    } catch (error) {
+      console.error("Staff ID verification error:", error);
+      res.status(500).json({ error: "Verification failed" });
     }
-
-    // Mark as verified for this session
-    await supabase
-      .from("users")
-      .update({ admin_staff_id_verified: true })
-      .eq("id", userId);
-
-    // Log successful verification
-    await supabase.from("security_logs").insert({
-      user_id: userId,
-      event_type: "staff_id_verified",
-      details: { ip: req.ip },
-      ip_address: req.ip,
-      timestamp: new Date().toISOString(),
-    });
-
-    res.json({
-      valid: true,
-      message: "Staff ID verified successfully",
-    });
-  } catch (error) {
-    console.error("Staff ID verification error:", error);
-    res.status(500).json({ error: "Verification failed" });
-  }
-});
+  },
+);
 
 // Get admin's staff ID status (for display in modal)
 app.get(
@@ -15285,6 +14686,12 @@ app.use("/api/user/savings/generic", authenticate, savingsGenericRouter);
 
 app.use("/api/user/savings/status", authenticate, savingsStatusRouter);
 
+// User-facing support/chat — isolated Supabase project, see support-db.js
+app.use("/api/support", authenticate, supportRoutes);
+
+// Admin support queue + bot topic management
+app.use("/api/sys/support", authenticate, authorizeAdmin, supportAdminRoutes);
+
 // ==================== USER ACCOUNT CLOSURE ROUTES ====================
 
 // Check if user is eligible to close account
@@ -15810,12 +15217,8 @@ app.get(
 // cron entries.
 app.get("/api/cron/external-transfers", externalTransferWorker.cronHandler);
 
-
-
 // ADD this — the reconciliation sweep that's been completely unwired until now:
 app.get("/api/cron/transfer-webhooks", transferWebhookHandler.cronHandler);
-
-
 
 // ==================== SAVINGS POOL & MONEY MANAGEMENT API ROUTES ====================
 
@@ -15920,296 +15323,6 @@ app.get(
     } catch (error) {
       console.error("Pool stats error:", error);
       res.status(500).json({ error: error.message });
-    }
-  },
-);
-
-// ==================== ENHANCED LIVE CHAT API (POLLING WITH UNREAD COUNTS) ====================
-
-// IMPORTANT: Put SPECIFIC routes BEFORE parameterized routes
-
-// 1. Get unread counts (SPECIFIC route - no parameter)
-app.get(
-  "/api/sys/live-chat/unread-counts",
-  authenticate,
-  authorizeAdmin,
-  async (req, res) => {
-    try {
-      console.log("[Chat] Getting unread counts");
-
-      // Get unread counts per user
-      const { data: unreadData, error } = await supabase
-        .from("live_support_messages")
-        .select("user_id, status")
-        .eq("is_from_admin", false)
-        .eq("status", "sent");
-
-      if (error) {
-        console.error("[Chat] Unread counts error:", error);
-        return res.status(500).json({ error: error.message });
-      }
-
-      const unreadCounts = {};
-      for (const msg of unreadData || []) {
-        unreadCounts[msg.user_id] = (unreadCounts[msg.user_id] || 0) + 1;
-      }
-
-      res.json({ unread_counts: unreadCounts });
-    } catch (error) {
-      console.error("Unread counts error:", error);
-      res.status(500).json({ error: "Failed to get unread counts" });
-    }
-  },
-);
-
-// 2. Get conversation status (SPECIFIC route)
-app.get(
-  "/api/sys/live-chat/conversations/status",
-  authenticate,
-  authorizeAdmin,
-  async (req, res) => {
-    try {
-      // Get last message times and unread counts for all users
-      const { data: lastMessages } = await supabase
-        .from("live_support_messages")
-        .select("user_id, created_at, is_from_admin")
-        .order("created_at", { ascending: false });
-
-      const { data: unreadMessages } = await supabase
-        .from("live_support_messages")
-        .select("user_id")
-        .eq("is_from_admin", false)
-        .eq("status", "sent");
-
-      const lastMessageTimes = {};
-      const unreadCounts = {};
-
-      for (const msg of lastMessages || []) {
-        if (!lastMessageTimes[msg.user_id]) {
-          lastMessageTimes[msg.user_id] = {
-            time: msg.created_at,
-            is_from_admin: msg.is_from_admin,
-          };
-        }
-      }
-
-      for (const msg of unreadMessages || []) {
-        unreadCounts[msg.user_id] = (unreadCounts[msg.user_id] || 0) + 1;
-      }
-
-      res.json({
-        last_message_times: lastMessageTimes,
-        unread_counts: unreadCounts,
-        timestamp: new Date().toISOString(),
-      });
-    } catch (error) {
-      console.error("Conversation status error:", error);
-      res.status(500).json({ error: "Failed to get status" });
-    }
-  },
-);
-
-// 3. Get all users with conversations (PARAMETERIZED - uses query, not path param)
-app.get(
-  "/api/sys/live-chat/users",
-  authenticate,
-  authorizeAdmin,
-  async (req, res) => {
-    try {
-      console.log("[Chat] Getting users with conversations");
-
-      // Get all users who have sent messages, with their latest message and unread count
-      const { data: conversations, error } = await supabase
-        .from("live_support_messages")
-        .select(
-          `
-        user_id,
-        users:user_id (
-          id,
-          first_name,
-          last_name,
-          email,
-          last_chat_read_at
-        ),
-        message,
-        created_at,
-        is_from_admin,
-        status
-      `,
-        )
-        .order("created_at", { ascending: false });
-
-      if (error) {
-        console.error("[Chat] Conversations fetch error:", error);
-        return res.status(500).json({ error: error.message });
-      }
-
-      // Group by user and get latest message + unread count
-      const userMap = new Map();
-
-      for (const msg of conversations || []) {
-        const userId = msg.user_id;
-        const user = msg.users;
-
-        if (!userMap.has(userId)) {
-          // Get unread count for this user
-          const { count: unreadCount, error: countError } = await supabase
-            .from("live_support_messages")
-            .select("*", { count: "exact", head: true })
-            .eq("user_id", userId)
-            .eq("is_from_admin", false)
-            .eq("status", "sent");
-
-          if (countError) {
-            console.error(
-              "[Chat] Unread count error for user",
-              userId,
-              countError,
-            );
-          }
-
-          // Get last read time for admin
-          const lastReadAt = user?.last_chat_read_at || null;
-
-          userMap.set(userId, {
-            user_id: userId,
-            user_name: user
-              ? `${user.first_name || ""} ${user.last_name || ""}`.trim()
-              : "Unknown User",
-            user_email: user?.email || "",
-            last_message: msg.message,
-            last_message_time: msg.created_at,
-            last_message_is_from_admin: msg.is_from_admin,
-            unread_count: unreadCount || 0,
-            last_read_at: lastReadAt,
-            has_unread: (unreadCount || 0) > 0,
-          });
-        }
-      }
-
-      // Convert to array and sort: unread first, then by last message time
-      const sortedUsers = Array.from(userMap.values()).sort((a, b) => {
-        // Unread conversations first
-        if (a.has_unread && !b.has_unread) return -1;
-        if (!a.has_unread && b.has_unread) return 1;
-        // Then by last message time (newest first)
-        return new Date(b.last_message_time) - new Date(a.last_message_time);
-      });
-
-      res.json({ users: sortedUsers });
-    } catch (error) {
-      console.error("Admin live chat users error:", error);
-      res
-        .status(500)
-        .json({ error: "Failed to load conversations: " + error.message });
-    }
-  },
-);
-
-// 4. Get messages for a specific user (PARAMETERIZED - this comes LAST)
-app.get(
-  "/api/sys/live-chat/:userId",
-  authenticate,
-  authorizeAdmin,
-  async (req, res) => {
-    try {
-      const { userId } = req.params;
-
-      console.log("[Chat] Getting messages for user:", userId);
-
-      // Validate UUID format
-      const uuidRegex =
-        /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-      if (!uuidRegex.test(userId)) {
-        return res.status(400).json({ error: "Invalid user ID format" });
-      }
-
-      // Get all messages for this user
-      const { data: messages, error } = await supabase
-        .from("live_support_messages")
-        .select("*")
-        .eq("user_id", userId)
-        .order("created_at", { ascending: true });
-
-      if (error) {
-        console.error("[Chat] Messages fetch error:", error);
-        return res.status(500).json({ error: error.message });
-      }
-
-      // Mark all unread messages as read when admin views them
-      const { error: updateError } = await supabase
-        .from("live_support_messages")
-        .update({
-          status: "read",
-          read_at: new Date().toISOString(),
-        })
-        .eq("user_id", userId)
-        .eq("is_from_admin", false)
-        .eq("status", "sent");
-
-      if (updateError) {
-        console.error("[Chat] Mark as read error:", updateError);
-      }
-
-      // Update user's last_chat_read_at
-      await supabase
-        .from("users")
-        .update({ last_chat_read_at: new Date().toISOString() })
-        .eq("id", userId);
-
-      res.json({ messages: messages || [] });
-    } catch (error) {
-      console.error("Get user chat error:", error);
-      res.status(500).json({ error: "Failed to load chat: " + error.message });
-    }
-  },
-);
-
-// 5. Send reply (admin) - POST route
-app.post(
-  "/api/sys/live-chat/:userId",
-  authenticate,
-  authorizeAdmin,
-  async (req, res) => {
-    try {
-      const { userId } = req.params;
-      const { message } = req.body;
-
-      console.log("[Chat] Sending reply to user:", userId);
-
-      // Validate UUID format
-      const uuidRegex =
-        /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-      if (!uuidRegex.test(userId)) {
-        return res.status(400).json({ error: "Invalid user ID format" });
-      }
-
-      if (!message || !message.trim()) {
-        return res.status(400).json({ error: "Message cannot be empty" });
-      }
-
-      const { data: newMessage, error } = await supabase
-        .from("live_support_messages")
-        .insert({
-          user_id: userId,
-          admin_id: req.user.id,
-          message: message.trim(),
-          is_from_admin: true,
-          status: "sent",
-          created_at: new Date().toISOString(),
-        })
-        .select()
-        .single();
-
-      if (error) {
-        console.error("[Chat] Insert error:", error);
-        return res.status(500).json({ error: error.message });
-      }
-
-      res.json({ success: true, message: newMessage });
-    } catch (error) {
-      console.error("Send reply error:", error);
-      res.status(500).json({ error: "Failed to send reply: " + error.message });
     }
   },
 );
@@ -17971,18 +17084,11 @@ app.post(
 
       // Create notification for user
       await supabase.from("notifications").insert({
-        user_id: card.user_id,
+        user_id: req.user.id,
         title: "Card Reported Lost/Stolen",
-        message: `Your card ending in ${card.card_number.slice(-4)} has been reported as lost/stolen. A new card will be issued.`,
+        message:
+          "Your card has been reported as lost/stolen. A new card will be issued. Open Support Chat if you need anything else.",
         type: "danger",
-      });
-
-      // Create support ticket
-      await supabase.from("support_tickets").insert({
-        user_id: card.user_id,
-        subject: "Lost/Stolen Card Reported",
-        message: `Card ending in ${card.card_number.slice(-4)} reported as lost/stolen by administrator.`,
-        priority: "high",
       });
 
       // Log admin action
@@ -17997,247 +17103,6 @@ app.post(
     } catch (error) {
       console.error("Admin report card error:", error);
       res.status(500).json({ error: "Failed to report card" });
-    }
-  },
-);
-
-// FIXED: GET /api/sys/support-tickets (no more 500)
-app.get(
-  "/api/sys/support-tickets",
-  authenticate,
-  authorizeAdmin,
-  async (req, res) => {
-    try {
-      const { status, search } = req.query;
-
-      let query = supabase
-        .from("support_tickets")
-        .select(
-          `
-                *,
-                users!user_id (first_name, last_name, email)
-            `,
-        )
-        .order("created_at", { ascending: false });
-
-      if (status) query = query.eq("status", status);
-      if (search) query = query.ilike("subject", `%${search}%`);
-
-      const { data: tickets, error } = await query;
-
-      if (error) throw error;
-
-      res.json({ tickets: tickets || [] });
-    } catch (err) {
-      console.error("Support tickets error:", err.message);
-      res.status(500).json({ error: "Failed to load tickets" });
-    }
-  },
-);
-
-// Get support tickets (admin)
-app.get(
-  "/api/sys/support-tickets",
-  authenticate,
-  authorizeAdmin,
-  async (req, res) => {
-    try {
-      const { status, priority, page = 1, limit = 20 } = req.query;
-      const offset = (page - 1) * limit;
-
-      let query = supabase
-        .from("support_tickets")
-        .select("*, user:users(first_name, last_name, email)", {
-          count: "exact",
-        });
-
-      if (status) {
-        query = query.eq("status", status);
-      }
-
-      if (priority) {
-        query = query.eq("priority", priority);
-      }
-
-      const {
-        data: tickets,
-        count,
-        error,
-      } = await query
-        .order("created_at", { ascending: false })
-        .range(offset, offset + limit - 1);
-
-      if (error) throw error;
-
-      res.json({
-        tickets,
-        pagination: {
-          page: parseInt(page),
-          limit: parseInt(limit),
-          total: count,
-          pages: Math.ceil(count / limit),
-        },
-      });
-    } catch (error) {
-      console.error("Admin tickets fetch error:", error);
-      res.status(500).json({ error: "Failed to fetch support tickets" });
-    }
-  },
-);
-
-// ==================== FIXED SUPPORT TICKET MESSAGES ROUTE ====================
-
-// Get messages for a support ticket (admin) - FIXED
-app.get(
-  "/api/sys/support-tickets/:ticketId/messages",
-  authenticate,
-  authorizeAdmin,
-  async (req, res) => {
-    try {
-      const { ticketId } = req.params;
-
-      // First verify ticket exists
-      const { data: ticket, error: ticketError } = await supabase
-        .from("support_tickets")
-        .select("id, user_id, status")
-        .eq("id", ticketId)
-        .single();
-
-      if (ticketError || !ticket) {
-        return res.status(404).json({ error: "Ticket not found" });
-      }
-
-      // Get messages with sender info
-      const { data: messages, error } = await supabase
-        .from("chat_messages")
-        .select(
-          `
-          *,
-          sender:sender_id (id, first_name, last_name, email, role)
-        `,
-        )
-        .eq("ticket_id", ticketId)
-        .order("created_at", { ascending: true });
-
-      if (error) {
-        console.error("Messages fetch error:", error);
-        return res.status(500).json({ error: "Failed to fetch messages" });
-      }
-
-      // Also get user info for the ticket
-      const { data: user } = await supabase
-        .from("users")
-        .select("first_name, last_name, email")
-        .eq("id", ticket.user_id)
-        .single();
-
-      res.json({
-        messages: messages || [],
-        ticket: {
-          id: ticket.id,
-          status: ticket.status,
-          user: user,
-        },
-      });
-    } catch (error) {
-      console.error("Support ticket messages error:", error);
-      res.status(500).json({ error: "Failed to fetch ticket messages" });
-    }
-  },
-);
-
-// Reply to support ticket (admin)
-app.post(
-  "/api/sys/support-tickets/:ticketId/reply",
-  authenticate,
-  authorizeAdmin,
-  async (req, res) => {
-    try {
-      const { ticketId } = req.params;
-      const { message } = req.body;
-
-      // Update ticket status
-      await supabase
-        .from("support_tickets")
-        .update({
-          status: "in_progress",
-          updated_at: new Date(),
-        })
-        .eq("id", ticketId);
-
-      // Add admin reply
-      const { data: reply } = await supabase
-        .from("chat_messages")
-        .insert({
-          ticket_id: ticketId,
-          sender_id: req.user.id,
-          message,
-          is_admin_reply: true,
-        })
-        .select()
-        .single();
-
-      // Get ticket to get user_id
-      const { data: ticket } = await supabase
-        .from("support_tickets")
-        .select("user_id")
-        .eq("id", ticketId)
-        .single();
-
-      // Create notification for user
-      await supabase.from("notifications").insert({
-        user_id: ticket.user_id,
-        title: "New Support Reply",
-        message: "An admin has replied to your support ticket",
-        type: "info",
-        action_url: `/support/${ticketId}`,
-      });
-
-      res.json({ message: "Reply sent successfully", reply });
-    } catch (error) {
-      console.error("Admin ticket reply error:", error);
-      res.status(500).json({ error: "Failed to send reply" });
-    }
-  },
-);
-
-// Close support ticket (admin)
-app.post(
-  "/api/sys/support-tickets/:ticketId/close",
-  authenticate,
-  authorizeAdmin,
-  async (req, res) => {
-    try {
-      const { ticketId } = req.params;
-      const { resolution } = req.body;
-
-      await supabase
-        .from("support_tickets")
-        .update({
-          status: "closed",
-          updated_at: new Date(),
-        })
-        .eq("id", ticketId);
-
-      // Get ticket to get user_id
-      const { data: ticket } = await supabase
-        .from("support_tickets")
-        .select("user_id")
-        .eq("id", ticketId)
-        .single();
-
-      // Create notification
-      await supabase.from("notifications").insert({
-        user_id: ticket.user_id,
-        title: "Support Ticket Closed",
-        message: resolution || "Your support ticket has been closed",
-        type: "info",
-      });
-
-      res.json({ message: "Ticket closed successfully" });
-    } catch (error) {
-      console.error("Admin close ticket error:", error);
-      res.status(500).json({ error: "Failed to close ticket" });
     }
   },
 );
@@ -18356,7 +17221,7 @@ app.get(
           .from("user_push_tokens")
           .select("user_id", { count: "exact", head: true })
           //.eq("platform", "onesignal")
-          .in("platform", ["android", "ios"]) 
+          .in("platform", ["android", "ios"])
           .eq("is_active", true),
       ]);
 
@@ -18435,7 +17300,7 @@ app.get(
         .select("user_id")
         .in("user_id", userIds)
         //.eq("platform", "onesignal")
-        .in("platform", ["android", "ios"]) 
+        .in("platform", ["android", "ios"])
         .eq("is_active", true);
 
       const pushEnabledUserIds = new Set(tokens?.map((t) => t.user_id) || []);
@@ -18503,7 +17368,7 @@ app.post(
             .from("user_push_tokens")
             .select("user_id")
             //.eq("platform", "onesignal")
-            .in("platform", ["android", "ios"]) 
+            .in("platform", ["android", "ios"])
             .eq("is_active", true);
           userIds = [...new Set(tokenUsers?.map((t) => t.user_id) || [])];
           break;
@@ -18720,7 +17585,7 @@ app.post(
         .select("push_token")
         .eq("user_id", user_id)
         //.eq("platform", "onesignal")
-        .in("platform", ["android", "ios"]) 
+        .in("platform", ["android", "ios"])
         .eq("is_active", true);
 
       if (!tokens || tokens.length === 0) {
@@ -18992,9 +17857,7 @@ app.get(
       res.json({ success: true, clips: clips || [] });
     } catch (error) {
       console.error("attack-detection clips error:", error);
-      res
-        .status(500)
-        .json({ success: false, message: "Failed to load clips" });
+      res.status(500).json({ success: false, message: "Failed to load clips" });
     }
   },
 );
@@ -19125,12 +17988,6 @@ app.get("/api/sys/stats", authenticate, authorizeAdmin, async (req, res) => {
 
     const todayVolume = volumeData?.reduce((sum, t) => sum + t.amount, 0) || 0;
 
-    // Open support tickets
-    const { count: openTickets } = await supabase
-      .from("support_tickets")
-      .select("*", { count: "exact", head: true })
-      .eq("status", "open");
-
     res.json({
       totalUsers,
       activeUsers,
@@ -19140,7 +17997,7 @@ app.get("/api/sys/stats", authenticate, authorizeAdmin, async (req, res) => {
       passcodeUsers,
       todayTransactions,
       todayVolume,
-      openTickets,
+      //openTickets,
       timestamp: new Date(),
     });
   } catch (error) {
