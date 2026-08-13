@@ -14945,6 +14945,10 @@ app.delete(
   },
 );
 
+
+
+
+
 // ============================================================
 // GET FLUTTERWAVE BANKS
 // ============================================================
@@ -14966,7 +14970,8 @@ app.post(
   checkAccountFrozen,
   async (req, res) => {
     try {
-      const { account_number, bank_code } = req.body;
+      //const { account_number, bank_code } = req.body;
+      const { account_number, bank_code, bank_name } = req.body;
 
       if (!account_number || !/^\d{10}$/.test(account_number)) {
         return res.status(400).json({
@@ -14977,20 +14982,21 @@ app.post(
 
       // Step 1: Resolve from cache/beneficiaries
       const resolution = await accountResolutionCache.resolveAccount({
-        accountNumber: account_number,
-        bankCode: bank_code || null,
-        userId: req.user.id,
-        maxResults: 5,
-      });
+  accountNumber: account_number,
+  bankCode: bank_code || null,
+  bankName: bank_name || null,
+  userId: req.user.id,
+  maxResults: 5,
+});
 
       if (resolution.found) {
         // Record the hit for analytics
         if (resolution.results.length > 0) {
-          accountResolutionCache.recordHit(
-            account_number,
-            resolution.results[0].bank_code,
-          );
-        }
+  accountResolutionCache.recordHit(
+    account_number,
+    resolution.results[0].bank_name,
+  );
+}
 
         return res.json({
           success: true,
@@ -15109,7 +15115,10 @@ app.post(
   },
 );
 
-// ── DELETE BENEFICIARY ─────────────────────────────────────────────
+
+
+
+// ── DELETE BENEFICIARY ──────────────────────────────────
 app.delete(
   "/api/user/beneficiaries/:id",
   authenticate,
@@ -15425,6 +15434,9 @@ app.get("/api/cron/external-transfers", externalTransferWorker.cronHandler);
 
 // ADD this — the reconciliation sweep that's been completely unwired until now:
 app.get("/api/cron/transfer-webhooks", transferWebhookHandler.cronHandler);
+
+
+app.get("/api/cron/cleanup-account-cache", accountResolutionCache.cronHandler);
 
 // ==================== SAVINGS POOL & MONEY MANAGEMENT API ROUTES ====================
 
