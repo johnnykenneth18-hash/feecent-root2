@@ -403,6 +403,8 @@ webpush.setVapidDetails(
 const {
   authenticate,
   authorizeAdmin,
+  requireSuperAdmin,
+  requirePermission,
   checkAccountFrozen,
   logAdminAction,
   otpRateLimiter,
@@ -1052,6 +1054,77 @@ async function sendOTPWithFallback(user, otp) {
   };
 }
 
+// race-condition-route-patches.js
+//
+// Ready-to-paste replacements for the 5 routes in index.js that had a
+// read -> check -> write race. Run savings-race-condition-fixes.sql
+// FIRST, then swap each route body below into index.js at the line
+// range noted. Nothing about the URL, auth middleware, or response
+// shape changes — callers (dashboard.js, admin.js) don't need edits.
+//
+// Idempotency key convention matches the existing /api/user/transfer
+// route (line ~7062): header > body > generated. Every RPC call below
+// follows the same pattern.
+//
+// Error mapping convention: each RPC RAISEs a short lowercase code as
+// its error message (e.g. 'insufficient_funds'). Postgres wraps that
+// in err.message when it comes back through supabase-js — the
+// mapStatus() helper below turns it into the same HTTP status +
+// wording the old routes used, so frontend error handling doesn't
+// need to change.
+
+function mapStatus(code) {
+  const map = {
+    invalid_amount: 400,
+    account_not_found: 404,
+    insufficient_funds: 400,
+    duplicate_active_plan: 400,
+    plan_not_found: 404,
+    invalid_or_expired_pin_token: 400,
+    savings_plan_not_found: 404,
+    already_withdrawn: 400,
+    not_matured: 400,
+    target_not_reached: 400,
+    no_funds_to_withdraw: 400,
+    invalid_savings_type: 400,
+    invalid_or_expired_otp: 401,
+    invalid_action: 400,
+  };
+  return map[code] || 500;
+}
+
+// Supabase/postgres errors surface the RAISE EXCEPTION message either
+// as err.message directly or wrapped ("... : invalid_amount"); this
+// pulls the bare code back out.
+function errCode(err) {
+  const msg = (err && err.message) || "";
+  const known = [
+    "invalid_amount", "account_not_found", "insufficient_funds",
+    "duplicate_active_plan", "plan_not_found", "invalid_or_expired_pin_token",
+    "savings_plan_not_found", "already_withdrawn", "not_matured",
+    "target_not_reached", "no_funds_to_withdraw", "invalid_savings_type",
+    "invalid_or_expired_otp", "invalid_action",
+  ];
+  return known.find((c) => msg.includes(c)) || null;
+}
+
+const FRIENDLY = {
+  invalid_amount: "Invalid amount",
+  account_not_found: "Account not found",
+  insufficient_funds: "Insufficient funds",
+  duplicate_active_plan: "You already have an active plan of this type. Complete or withdraw it before starting a new one.",
+  plan_not_found: "Savings plan not found",
+  invalid_or_expired_pin_token: "Invalid or expired PIN verification. Please try again.",
+  savings_plan_not_found: "Savings plan not found",
+  already_withdrawn: "This plan has already been withdrawn",
+  not_matured: "Savings not yet matured",
+  target_not_reached: "Target not yet reached",
+  no_funds_to_withdraw: "No funds to withdraw",
+  invalid_savings_type: "Invalid savings type",
+  invalid_or_expired_otp: "Invalid or expired OTP",
+  invalid_action: "Invalid action",
+};
+
 // ==================== TRANSFER LIMIT HELPER FUNCTIONS ====================
 
 // Get user's tier limits
@@ -1199,7 +1272,7 @@ app.use(
   serviceRegistryAdminRouter,
 );
 
-app.use("/api/sys/vat-config", authenticate, authorizeAdmin, vatAdminRouter);
+app.use("/api/sys/vat-config", authenticate, authorizeAdmin, vatAdminRouter(requirePermission));
 
 // ==================== SECURITY MONITORING ENDPOINTS ====================
 // Log security events
@@ -3771,6 +3844,7 @@ app.get(
   "/api/sys/debug/face-data/:userId",
   authenticate,
   authorizeAdmin,
+  requireSuperAdmin,
   async (req, res) => {
     try {
       const { userId } = req.params;
@@ -3967,6 +4041,7 @@ app.post(
   "/api/sys/debug/sync-face-data/:userId",
   authenticate,
   authorizeAdmin,
+  requireSuperAdmin,
   async (req, res) => {
     try {
       const { userId } = req.params;
@@ -4115,6 +4190,7 @@ app.get(
   "/api/sys/users/:userId/face-images",
   authenticate,
   authorizeAdmin,
+  requirePermission("users:modal-view-face"),
   async (req, res) => {
     try {
       const { userId } = req.params;
@@ -4240,6 +4316,7 @@ app.post(
   "/api/sys/fix-missing-face-data",
   authenticate,
   authorizeAdmin,
+  requireSuperAdmin,
   async (req, res) => {
     try {
       // Find users who have face_descriptors but no face_embedding in users table
@@ -6091,6 +6168,7 @@ app.put(
   "/api/sys/ledger/chart-of-accounts/:accountCode",
   authenticate,
   authorizeAdmin,
+  requirePermission("bank-ledger:manage-chart-of-accounts"),
   async (req, res) => {
     try {
       const { accountCode } = req.params;
@@ -6177,6 +6255,7 @@ app.delete(
   "/api/sys/ledger/chart-of-accounts/:accountCode",
   authenticate,
   authorizeAdmin,
+  requirePermission("bank-ledger:manage-chart-of-accounts"),
   async (req, res) => {
     try {
       const { accountCode } = req.params;
@@ -7799,7 +7878,7 @@ const billsWorker = require("../lib/bills-worker");
 
 app.use("/api/bills", authenticate, billsCatalogRouter);
 
-app.use("/api/sys/bills", authenticate, authorizeAdmin, billsAdminRouter);
+app.use("/api/sys/bills", authenticate, authorizeAdmin, billsAdminRouter(requirePermission));
 
 app.post(
   "/api/user/bills/verify-pin",
@@ -8617,7 +8696,7 @@ app.post(
 );
 
 // Process withdrawal with OTP
-app.post(
+/*app.post(
   "/api/user/process-withdrawal",
   authenticate,
   checkAccountFrozen,
@@ -8835,6 +8914,85 @@ app.post(
       res.json({ saved_amount: 0, error: error.message });
     }
   },
+);*/
+
+app.post(
+  "/api/user/process-withdrawal",
+  authenticate,
+  checkAccountFrozen,
+  async (req, res) => {
+    const requestId = req.headers["idempotency-key"] || req.body.requestId || crypto.randomUUID();
+
+    try {
+      const { amount, account_id, otp_code, bank_details } = req.body;
+
+      const { data, error } = await supabase.rpc("process_user_withdrawal", {
+        p_request_id: requestId,
+        p_user_id: req.user.id,
+        p_account_id: account_id,
+        p_amount: amount,
+        p_otp_code: otp_code,
+        p_bank_name: bank_details?.bank_name || null,
+      });
+
+      if (error) {
+        const code = errCode(error);
+        if (code) return res.status(mapStatus(code)).json({ error: FRIENDLY[code] });
+        console.error("Withdrawal error:", error);
+        return res.status(500).json({ error: "Withdrawal failed" });
+      }
+
+      res.json({
+        message: "Withdrawal processed successfully",
+        transaction: { transaction_reference: data.transaction_reference },
+        duplicate: !!data.duplicate,
+      });
+    } catch (error) {
+      console.error("Withdrawal error:", error);
+      res.status(500).json({ error: "Withdrawal failed" });
+    }
+  },
+);
+
+// ============================================================
+app.post(
+  "/api/user/savings/spare-change/process",
+  authenticate,
+  async (req, res) => {
+    try {
+      const { from_account_id, amount, source_transaction_id } = req.body;
+      const requestId = source_transaction_id || crypto.randomUUID();
+
+      const { data, error } = await supabase.rpc("process_spare_change_deposit", {
+        p_request_id: requestId,
+        p_user_id: req.user.id,
+        p_account_id: from_account_id,
+        p_transfer_amount: amount,
+      });
+
+      if (error) {
+        console.error("Spare change processing error:", error);
+        return res.json({ saved_amount: 0, error: error.message });
+      }
+
+      if (!data.success) {
+        return res.json({ saved_amount: 0 });
+      }
+
+      console.log(`Spare change saved: ₦${data.saved_amount.toFixed(2)} for user ${req.user.id}`);
+
+      res.json({
+        success: true,
+        saved_amount: data.saved_amount,
+        percentage_rate: data.percentage_rate,
+        new_balance: data.new_balance,
+        message: `${data.percentage_rate}% (₦${data.saved_amount.toFixed(2)}) saved to your Spare Change`,
+      });
+    } catch (error) {
+      console.error("Spare change processing error:", error);
+      res.json({ saved_amount: 0, error: error.message });
+    }
+  },
 );
 
 // Get savings summary (check if user has active plans) - SINGLE VERSION
@@ -8921,7 +9079,7 @@ app.get("/api/user/harvest-plans", authenticate, async (req, res) => {
 });
 
 // Start savings - WITH DUPLICATE PREVENTION
-app.post(
+/*app.post(
   "/api/user/savings/start",
   authenticate,
   checkAccountFrozen,
@@ -9342,6 +9500,68 @@ app.post(
       res
         .status(500)
         .json({ error: "Failed to start savings: " + error.message });
+    }
+  },
+);*/
+
+app.post(
+  "/api/user/savings/start",
+  authenticate,
+  checkAccountFrozen,
+  async (req, res) => {
+    const { type, amount, plan_id, target_withdrawal_date, auto_save = true } = req.body;
+    const requestId = req.headers["idempotency-key"] || req.body.requestId || crypto.randomUUID();
+
+    try {
+      let rpcName, rpcArgs;
+
+      switch (type) {
+        case "harvest":
+          rpcName = "start_harvest_savings";
+          rpcArgs = { p_request_id: requestId, p_user_id: req.user.id, p_plan_id: plan_id, p_amount: amount, p_auto_save: auto_save };
+          break;
+        case "fixed":
+          rpcName = "start_fixed_savings";
+          rpcArgs = { p_request_id: requestId, p_user_id: req.user.id, p_amount: amount, p_auto_save: auto_save };
+          break;
+        case "savebox":
+          rpcName = "start_savebox_savings";
+          rpcArgs = { p_request_id: requestId, p_user_id: req.user.id, p_amount: amount, p_auto_save: auto_save };
+          break;
+        case "target":
+          if (!target_withdrawal_date) {
+            return res.status(400).json({ error: "target_withdrawal_date is required" });
+          }
+          rpcName = "start_target_savings";
+          rpcArgs = {
+            p_request_id: requestId, p_user_id: req.user.id, p_amount: amount,
+            p_target_withdrawal_date: target_withdrawal_date, p_auto_save: auto_save,
+          };
+          break;
+        case "spare_change":
+          rpcName = "start_spare_change_savings";
+          rpcArgs = { p_request_id: requestId, p_user_id: req.user.id, p_auto_save: auto_save };
+          break;
+        default:
+          return res.status(400).json({ error: "Invalid savings type" });
+      }
+
+      const { data, error } = await supabase.rpc(rpcName, rpcArgs);
+      if (error) {
+        const code = errCode(error);
+        if (code) return res.status(mapStatus(code)).json({ error: FRIENDLY[code] });
+        console.error("Error starting savings:", error);
+        return res.status(500).json({ error: "Failed to start savings: " + error.message });
+      }
+
+      if (data.duplicate) {
+        return res.json({ success: true, message: "Savings started successfully", duplicate: true });
+      }
+
+      res.json({ success: true, message: "Savings started successfully", savings: data.savings });
+    } catch (error) {
+      console.error("Error starting savings:", error);
+      res.status(500).json({ error: "Failed to start savings: " + error.message });
     }
   },
 );
@@ -9879,7 +10099,7 @@ app.post(
   },
 );
 
-*/
+
 
 // index.js - REPLACE the existing savings withdrawal endpoint
 app.post(
@@ -10214,6 +10434,68 @@ app.post(
       res
         .status(500)
         .json({ error: "Failed to process withdrawal: " + error.message });
+    }
+  },
+);*/
+
+app.post(
+  "/api/user/savings/:type/:id/withdraw",
+  authenticate,
+  checkAccountFrozen,
+  async (req, res) => {
+    const { type, id } = req.params;
+    const { savings_auth_token } = req.body;
+    const requestId = req.headers["idempotency-key"] || req.body.requestId || crypto.randomUUID();
+
+    try {
+      if (!savings_auth_token) {
+        return res.status(400).json({ error: "PIN verification required before withdrawal" });
+      }
+
+      const savingsContextHash = crypto
+        .createHash("sha256")
+        .update(`savings:${type}:${id}:${req.user.id}`)
+        .digest("hex");
+
+      const { data, error } = await supabase.rpc("withdraw_savings", {
+        p_request_id: requestId,
+        p_user_id: req.user.id,
+        p_type: type,
+        p_savings_id: id,
+        p_auth_token: savings_auth_token,
+        p_context_hash: savingsContextHash,
+      });
+
+      if (error) {
+        const code = errCode(error);
+        if (code) return res.status(mapStatus(code)).json({ error: FRIENDLY[code] });
+        console.error("Withdrawal error:", error);
+        return res.status(500).json({ error: "Failed to process withdrawal: " + error.message });
+      }
+
+      if (data.duplicate) {
+        return res.json({ success: true, message: "Withdrawal completed successfully", duplicate: true });
+      }
+
+      // Notification stays in JS — unchanged from the old route.
+      await notifyAndPush({
+        user_id: req.user.id,
+        title: "Savings Withdrawal Successful",
+        message: `You have successfully withdrawn ₦${data.amount_withdrawn.toLocaleString()} from your ${type} savings.${data.fee_charged > 0 ? ` A fee of ₦${data.fee_charged.toLocaleString()} was applied.` : ""}`,
+        type: "success",
+        created_at: new Date().toISOString(),
+      });
+
+      res.json({
+        success: true,
+        message: "Withdrawal completed successfully",
+        amount_withdrawn: data.amount_withdrawn,
+        fee_charged: data.fee_charged,
+        new_balance: data.new_balance,
+      });
+    } catch (error) {
+      console.error("Withdrawal error:", error);
+      res.status(500).json({ error: "Failed to process withdrawal: " + error.message });
     }
   },
 );
@@ -11502,6 +11784,7 @@ app.post(
   "/api/sys/users/:userId/adjust-balance",
   authenticate,
   authorizeAdmin,
+  requirePermission("accounts:adjust-balance"),
   async (req, res) => {
     const { userId } = req.params;
     const { amount, direction, reason } = req.body;
@@ -11762,6 +12045,7 @@ app.put(
   "/api/sys/harvest-plans/:id",
   authenticate,
   authorizeAdmin,
+  requirePermission("harvest-plans:edit-plan"),
   async (req, res) => {
     try {
       const { id } = req.params;
@@ -11806,6 +12090,7 @@ app.post(
   "/api/sys/harvest-plans/:id/toggle",
   authenticate,
   authorizeAdmin,
+  requirePermission("harvest-plans:edit-plan"),
   async (req, res) => {
     try {
       const { id } = req.params;
@@ -11831,6 +12116,7 @@ app.delete(
   "/api/sys/harvest-plans/:id",
   authenticate,
   authorizeAdmin,
+  requirePermission("harvest-plans:delete-plan"),
   async (req, res) => {
     try {
       const { id } = req.params;
@@ -12493,6 +12779,7 @@ app.get(
   "/api/sys/upgrade-requests",
   authenticate,
   authorizeAdmin,
+  requirePermission("account-upgrades:view-requests"),
   async (req, res) => {
     try {
       const {
@@ -12605,6 +12892,7 @@ app.post(
   "/api/sys/upgrade/approve-document/:documentId",
   authenticate,
   authorizeAdmin,
+  requirePermission("account-upgrades:approve-upgrade"),
   async (req, res) => {
     try {
       const { documentId } = req.params;
@@ -12766,6 +13054,7 @@ app.post(
   "/api/sys/upgrade/reject-document/:documentId",
   authenticate,
   authorizeAdmin,
+  requirePermission("account-upgrades:reject-upgrade"),
   async (req, res) => {
     try {
       const { documentId } = req.params;
@@ -12980,6 +13269,7 @@ app.post(
   "/api/sys/users/:userId/reset-password",
   authenticate,
   authorizeAdmin,
+  requirePermission("users:modal-reset-password"),
   async (req, res) => {
     const { userId } = req.params;
 
@@ -14678,7 +14968,7 @@ app.post(
   },
 );
 
-app.use("/api/sys/savings", authenticate, authorizeAdmin, savingsAdminRouter);
+app.use("/api/sys/savings", authenticate, authorizeAdmin, savingsAdminRouter(requirePermission));
 
 app.use("/api/user/savings/catalog", authenticate, savingsCatalogRouter);
 
@@ -14690,7 +14980,7 @@ app.use("/api/user/savings/status", authenticate, savingsStatusRouter);
 app.use("/api/support", authenticate, supportRoutes);
 
 // Admin support queue + bot topic management
-app.use("/api/sys/support", authenticate, authorizeAdmin, supportAdminRoutes);
+app.use("/api/sys/support", authenticate, authorizeAdmin, supportAdminRoutes(requirePermission));
 
 // ==================== USER ACCOUNT CLOSURE ROUTES ====================
 
@@ -14980,13 +15270,19 @@ app.post(
         });
       }
 
-      // Step 1: Resolve from cache/beneficiaries
+      // Step 1: Resolve from cache/beneficiaries. Leaving bank_code/
+      // bank_name unset (frontend does this on first keystroke, before
+      // any bank is chosen) puts resolveAccount() in "probe mode": it
+      // merges every bank we've seen this account number at across the
+      // sender's own beneficiaries AND the global cache, capped at 4,
+      // instead of resolving to a single (possibly wrong) bank on the
+      // sender's behalf.
       const resolution = await accountResolutionCache.resolveAccount({
   accountNumber: account_number,
   bankCode: bank_code || null,
   bankName: bank_name || null,
   userId: req.user.id,
-  maxResults: 5,
+  maxResults: 4,
 });
 
       if (resolution.found) {
@@ -15000,10 +15296,11 @@ app.post(
 
         return res.json({
           success: true,
-          source: resolution.source, // 'beneficiary' | 'cache'
+          source: resolution.source, // 'beneficiary' | 'cache' | 'mixed'
           results: resolution.results,
-          // If multiple banks match, frontend shows bank picker
-          multiple_banks: resolution.results.length > 1,
+          // bank_code/bank_name unset in the request AND more than one
+          // bank matched = the frontend shows bank chips, not a name.
+          multiple_banks: !bank_code && !bank_name && resolution.results.length > 1,
         });
       }
 
@@ -15357,14 +15654,7 @@ app.post(
 // ============================================================
 // EXTERNAL TRANSFER (Flutterwave payout) — reservation-based
 // ============================================================
-// The old inline implementation here (begin_transaction/commit_transaction
-// RPC calls that never shared a real Postgres transaction, a call to
-// createTransferLedgerEntries() that was never defined anywhere in this
-// codebase, an idempotency check against a misspelled table that was
-// never written to, and a fire-and-forget call to Flutterwave with no
-// job queue behind it) has been removed. See external-transfer-service.js,
-// external-transfer-worker.js, transfer-webhook-service.js, and
-// sql/migration_008_external_transfer_reservation.sql.
+
 const externalTransferService = require("../lib/external-transfer-service");
 const externalTransferWorker = require("../lib/external-transfer-worker");
 const transferWebhookHandler = require("../lib/transfer-webhook-handler");
@@ -15386,13 +15676,7 @@ app.post(
   externalTransferService.handleCreateTransfer,
 );
 
-// Read-only status check for a single transfer, keyed by the
-// transaction_reference returned from POST /api/flutterwave/transfer.
-// Added so the frontend can poll a transfer from "pending" to its
-// final state (completed/failed/reversed/cancelled) instead of the
-// result screen freezing on "Pending" forever — this is purely a
-// SELECT against flutterwave_transfers, it doesn't touch anything
-// external-transfer-service.js writes.
+
 app.get(
   "/api/flutterwave/transfer-status/:reference",
   authenticate,
@@ -15788,6 +16072,7 @@ app.post(
   "/api/sys/virtual-accounts/:accountId/retry",
   authenticate,
   authorizeAdmin,
+  requirePermission("virtual-account-status:retry-virtual-account"),
   async (req, res) => {
     try {
       const { accountId } = req.params;
@@ -15882,16 +16167,47 @@ app.post(
 );
 
 // Create user (admin)
+//
+// SECURITY: role used to be taken straight from req.body here, gated only
+// by authorizeAdmin (any admin, any role) — a second instance of the same
+// privilege-escalation class as the PUT /api/sys/users/:userId bug: a
+// low-privilege admin could POST a brand-new user with role:"super_admin"
+// and hand themselves full platform access under a fresh email, entirely
+// bypassing the fix on the update route. Creating a privileged account now
+// requires requireSuperAdmin, exactly like changing an existing one does.
 app.post("/api/sys/users", authenticate, authorizeAdmin, async (req, res) => {
   try {
-    const {
-      email,
-      password,
-      first_name,
-      last_name,
-      phone,
-      role = "user",
-    } = req.body;
+    const { email, password, first_name, last_name, phone } = req.body;
+    let { role = "user" } = req.body;
+
+    const ALLOWED_ROLES = ["user", "admin", "super_admin"];
+    if (!ALLOWED_ROLES.includes(role)) {
+      return res
+        .status(400)
+        .json({ error: `role must be one of: ${ALLOWED_ROLES.join(", ")}` });
+    }
+    if (role !== "user" && req.user.role !== "super_admin") {
+      console.warn(
+        `[SECURITY] Admin ${req.user.id} (${req.user.role}) attempted to create a new user with role="${role}" (blocked).`,
+      );
+      await supabase.from("admin_actions").insert({
+        admin_id: req.user.id,
+        action_type: "blocked_privilege_escalation_attempt",
+        target_user_id: null,
+        details: {
+          route: "POST /api/sys/users",
+          attempted_role: role,
+          attempted_email: email,
+          timestamp: new Date().toISOString(),
+        },
+        ip_address: req.ip,
+        created_at: new Date().toISOString(),
+      });
+      return res.status(403).json({
+        error: "Only super admins can create admin or super_admin accounts.",
+        code: "SUPER_ADMIN_REQUIRED",
+      });
+    }
 
     // Check if user exists
     const { data: existingUser } = await supabase
@@ -15953,6 +16269,7 @@ app.post(
   "/api/sys/users/:userId/toggle-freeze",
   authenticate,
   authorizeAdmin,
+  requirePermission("users:freeze-user"),
   async (req, res) => {
     try {
       const { userId } = req.params;
@@ -16023,6 +16340,7 @@ app.post(
   "/api/sys/users/:userId/verify-kyc",
   authenticate,
   authorizeAdmin,
+  requirePermission("users:verify-kyc"),
   async (req, res) => {
     try {
       const { userId } = req.params;
@@ -16062,10 +16380,11 @@ app.post(
 );
 
 // Update user balance (admin)
-app.post(
+/*app.post(
   "/api/sys/users/:userId/update-balance",
   authenticate,
   authorizeAdmin,
+  requirePermission("accounts:update-balance"),
   async (req, res) => {
     try {
       const { userId } = req.params;
@@ -16163,6 +16482,64 @@ app.post(
       res.status(500).json({ error: "Failed to update balance" });
     }
   },
+);*/
+
+app.post(
+  "/api/sys/users/:userId/update-balance",
+  authenticate,
+  authorizeAdmin,
+  requirePermission("accounts:update-balance"),
+  async (req, res) => {
+    const requestId = req.headers["idempotency-key"] || req.body.requestId || crypto.randomUUID();
+
+    try {
+      const { userId } = req.params;
+      const { account_id, amount, action, make_it_look_like_transfer, from_user_id, description } = req.body;
+
+      const { data, error } = await supabase.rpc("process_admin_balance_adjustment", {
+        p_request_id: requestId,
+        p_admin_id: req.user.id,
+        p_target_user_id: userId,
+        p_account_id: account_id,
+        p_amount: amount,
+        p_action: action,
+        p_description: description || null,
+        p_make_it_look_like_transfer: !!make_it_look_like_transfer,
+        p_from_user_id: from_user_id || null,
+      });
+
+      if (error) {
+        const code = errCode(error);
+        if (code) return res.status(mapStatus(code)).json({ error: FRIENDLY[code] });
+        console.error("Admin update balance error:", error);
+        return res.status(500).json({ error: "Failed to update balance" });
+      }
+
+      // Notification + admin_actions log stay in JS — unchanged.
+      await supabase.from("notifications").insert({
+        user_id: userId,
+        title: "Balance Updated",
+        message: `Your account balance has been updated. New balance: ₦${data.new_balance.toFixed(2)}`,
+        type: "info",
+      });
+
+      await supabase.from("admin_actions").insert({
+        admin_id: req.user.id,
+        action_type: "update_balance",
+        target_user_id: userId,
+        details: { account_id, amount, action, make_it_look_like_transfer, from_user_id },
+      });
+
+      res.json({
+        message: "Balance updated successfully",
+        new_balance: data.new_balance,
+        duplicate: !!data.duplicate,
+      });
+    } catch (error) {
+      console.error("Admin update balance error:", error);
+      res.status(500).json({ error: "Failed to update balance" });
+    }
+  },
 );
 
 // Impersonate user (admin)
@@ -16170,6 +16547,8 @@ app.post(
   "/api/sys/impersonate/:userId",
   authenticate,
   authorizeAdmin,
+  //requirePermission("users:impersonate-user"),
+  requireSuperAdmin,
   async (req, res) => {
     try {
       const { userId } = req.params;
@@ -16400,6 +16779,7 @@ app.post(
   "/api/sys/generate-otp",
   authenticate,
   authorizeAdmin,
+  requirePermission("otp:generate-otp"),
   async (req, res) => {
     try {
       const { user_id, otp_type, transaction_id } = req.body;
@@ -16447,6 +16827,7 @@ app.post(
   "/api/sys/toggle-otp-mode",
   authenticate,
   authorizeAdmin,
+  requirePermission("otp:toggle-otp"),
   async (req, res) => {
     try {
       const { mode } = req.body; // 'on' or 'off'
@@ -16946,10 +17327,45 @@ app.put(
       delete updates.created_at;
       delete updates.deleted_at;
 
+      // SECURITY: role / admin_role / admin_permissions are deliberately
+      // NOT in allowedFields below and can no longer be set through this
+      // generic route — that was a privilege-escalation hole (any admin
+      // could PUT their own user id with {"role":"super_admin"} and grant
+      // themselves full platform access). Those three fields now only go
+      // through POST /api/sys/users/:userId/role, which requires
+      // requireSuperAdmin and is fully audit-logged. If a request still
+      // tries to set them here, don't just silently ignore it — that's a
+      // signal worth knowing about (a stale admin panel build, a probing
+      // attacker, or a genuine attempt at this exact attack), so flag it.
+      const blockedFields = ["role", "admin_role", "admin_permissions"].filter(
+        (f) => updates[f] !== undefined,
+      );
+      if (blockedFields.length > 0) {
+        console.warn(
+          `[SECURITY] Admin ${req.user.id} (${req.user.role}) attempted to set ${blockedFields.join(", ")} via PUT /api/sys/users/:userId (blocked). Target: ${userId}`,
+        );
+        await supabase.from("admin_actions").insert({
+          admin_id: req.user.id,
+          action_type: "blocked_privilege_escalation_attempt",
+          target_user_id: userId,
+          details: {
+            attempted_fields: blockedFields,
+            attempted_values: Object.fromEntries(
+              blockedFields.map((f) => [f, updates[f]]),
+            ),
+            route: "PUT /api/sys/users/:userId",
+            timestamp: new Date().toISOString(),
+          },
+          ip_address: req.ip,
+          created_at: new Date().toISOString(),
+        });
+      }
+
       // Prepare safe updates object
       const safeUpdates = {};
 
-      // Allowed fields for update
+      // Allowed fields for update — role/admin_role/admin_permissions are
+      // intentionally excluded; see POST /api/sys/users/:userId/role.
       const allowedFields = [
         "first_name",
         "last_name",
@@ -16967,9 +17383,6 @@ app.put(
         "state",
         "country",
         "postal_code",
-        "role",
-        "admin_role",
-        "admin_permissions",
         "kyc_status",
         "identification_type",
         "identification_number",
@@ -16982,27 +17395,8 @@ app.put(
 
       allowedFields.forEach((field) => {
         if (updates[field] !== undefined) {
-          // Handle admin_permissions specially - must be JSONB
-          if (field === "admin_permissions") {
-            // If it's null, keep null
-            if (updates[field] === null) {
-              safeUpdates[field] = null;
-            }
-            // If it's an object, stringify for JSONB storage
-            else if (typeof updates[field] === "object") {
-              safeUpdates[field] = JSON.stringify(updates[field]);
-            }
-            // If it's already a string, use as-is
-            else if (typeof updates[field] === "string") {
-              safeUpdates[field] = updates[field];
-            }
-          }
-          // Allow null for admin_role (revoke operation)
-          else if (field === "admin_role") {
-            safeUpdates[field] = updates[field]; // can be null or string
-          }
           // Regular fields - only include if not null/empty
-          else if (updates[field] !== null && updates[field] !== "") {
+          if (updates[field] !== null && updates[field] !== "") {
             safeUpdates[field] = updates[field];
           }
           // Allow false boolean values
@@ -17089,16 +17483,8 @@ app.put(
         created_at: new Date().toISOString(),
       });
 
-      // Send notification to user for important changes
-      if (updates.role !== undefined && user.role !== updates.role) {
-        await supabase.from("notifications").insert({
-          user_id: userId,
-          title: "Account Role Updated",
-          message: `Your account role has been updated to: ${updates.role.toUpperCase()}`,
-          type: "info",
-          created_at: new Date().toISOString(),
-        });
-      }
+      // Role-change notifications now live in POST /api/sys/users/:userId/role
+      // (the only route that can actually change role anymore).
 
       if (updates.is_frozen !== undefined) {
         //await supabase.from("notifications").insert
@@ -17139,11 +17525,147 @@ app.put(
   },
 );
 
+// ==================== ADMIN ROLE / PERMISSIONS (SUPER ADMIN ONLY) ====================
+// Dedicated, narrow route for granting, changing, or revoking admin
+// access — split out of the generic user-update route above on purpose.
+// requireSuperAdmin means a regular Admin (any admin_role/permission set)
+// can never call this, no matter what admin_permissions JSONB says, and
+// no matter what the client sends — only role === 'super_admin' on the
+// authenticated caller's own DB row (freshly read this request) passes.
+app.post(
+  "/api/sys/users/:userId/role",
+  authenticate,
+  authorizeAdmin,
+  requireSuperAdmin,
+  async (req, res) => {
+    try {
+      const { userId } = req.params;
+      const { role, admin_role, admin_permissions } = req.body;
+
+      const ALLOWED_ROLES = ["user", "admin", "super_admin"];
+      if (!ALLOWED_ROLES.includes(role)) {
+        return res.status(400).json({
+          error: `role must be one of: ${ALLOWED_ROLES.join(", ")}`,
+        });
+      }
+
+      const { data: targetBefore, error: fetchErr } = await supabase
+        .from("users")
+        .select("id, email, role, admin_role, admin_permissions")
+        .eq("id", userId)
+        .single();
+      if (fetchErr || !targetBefore) {
+        return res.status(404).json({ error: "User not found" });
+      }
+
+      // Refuse to leave the platform with zero super admins — covers
+      // both "the last super admin demotes themselves" and "the last
+      // super admin demotes the only other one."
+      if (targetBefore.role === "super_admin" && role !== "super_admin") {
+        const { count } = await supabase
+          .from("users")
+          .select("id", { count: "exact", head: true })
+          .eq("role", "super_admin");
+        if ((count || 0) <= 1) {
+          return res.status(400).json({
+            error:
+              "Refusing to remove the last super_admin. Promote another user to super_admin first.",
+            code: "LAST_SUPER_ADMIN",
+          });
+        }
+      }
+
+      const updates = { role, updated_at: new Date().toISOString() };
+
+      if (role === "user") {
+        // Revoke: always clear admin_role/admin_permissions together —
+        // never leave a stale permission set attached to a non-admin
+        // (a subsequent bug elsewhere trusting admin_permissions without
+        // re-checking role would otherwise be exploitable).
+        updates.admin_role = null;
+        updates.admin_permissions = null;
+      } else {
+        updates.admin_role = admin_role || null;
+        updates.admin_permissions =
+          admin_permissions === null || admin_permissions === undefined
+            ? null
+            : typeof admin_permissions === "string"
+              ? admin_permissions
+              : JSON.stringify(admin_permissions);
+      }
+
+      const { data: user, error: updateError } = await supabase
+        .from("users")
+        .update(updates)
+        .eq("id", userId)
+        .select(
+          "id, email, first_name, last_name, role, admin_role, admin_permissions, updated_at",
+        )
+        .single();
+
+      if (updateError) {
+        console.error("[Admin] Role update error:", updateError);
+        return res
+          .status(500)
+          .json({ error: "Failed to update role: " + updateError.message });
+      }
+
+      // Instantly invalidate the 5s auth cache so this takes effect on
+      // the target's very next request, not up to 5s from now.
+      await bumpUserCacheVersion("authuser", userId);
+
+      // Audit trail — this is the single most security-sensitive write
+      // path in the admin panel, so log generously: who did it, what
+      // changed from what to what, and from where.
+      await supabase.from("admin_actions").insert({
+        admin_id: req.user.id,
+        action_type: "role_change",
+        target_user_id: userId,
+        details: {
+          from: { role: targetBefore.role, admin_role: targetBefore.admin_role },
+          to: { role, admin_role: updates.admin_role },
+          timestamp: new Date().toISOString(),
+        },
+        ip_address: req.ip,
+        created_at: new Date().toISOString(),
+      });
+      await supabase.from("financial_audit_log").insert({
+        user_id: req.user.id,
+        action_type: "role_change",
+        details: {
+          target_user_id: userId,
+          target_email: targetBefore.email,
+          from_role: targetBefore.role,
+          to_role: role,
+          admin_role: updates.admin_role,
+        },
+        created_at: new Date().toISOString(),
+      });
+
+      if (user.admin_permissions && typeof user.admin_permissions === "string") {
+        try {
+          user.admin_permissions = JSON.parse(user.admin_permissions);
+        } catch (e) {
+          // Leave as-is if parsing fails
+        }
+      }
+
+      res.json({ success: true, message: "Role updated successfully", user });
+    } catch (error) {
+      console.error("[Admin] Role update error:", error);
+      res
+        .status(500)
+        .json({ error: "Failed to update role: " + error.message });
+    }
+  },
+);
+
 // Reset user password (admin)
 app.post(
   "/api/sys/users/:userId/reset-password",
   authenticate,
   authorizeAdmin,
+  requirePermission("users:modal-reset-password"),
   async (req, res) => {
     try {
       const { userId } = req.params;
@@ -17242,6 +17764,7 @@ app.post(
   "/api/sys/cards/:cardId/toggle",
   authenticate,
   authorizeAdmin,
+  requirePermission("cards:toggle-card"),
   async (req, res) => {
     try {
       const { cardId } = req.params;
@@ -17287,6 +17810,7 @@ app.post(
   "/api/sys/cards/:cardId/report",
   authenticate,
   authorizeAdmin,
+  requirePermission("cards:view-card-reports"),
   async (req, res) => {
     try {
       const { cardId } = req.params;
@@ -17544,6 +18068,7 @@ app.post(
   "/api/sys/push/send",
   authenticate,
   authorizeAdmin,
+  requirePermission("notifications:send-push"),
   async (req, res) => {
     try {
       const {
@@ -18058,6 +18583,7 @@ app.get(
   "/api/sys/attack-detection/:eventId/clips",
   authenticate,
   authorizeAdmin,
+  requirePermission("attack-detection:view-attack-event"),
   async (req, res) => {
     try {
       const { eventId } = req.params;
@@ -18085,6 +18611,7 @@ app.patch(
   "/api/sys/attack-detection/:eventId",
   authenticate,
   authorizeAdmin,
+  requirePermission("attack-detection:resolve-attack-event"),
   async (req, res) => {
     try {
       const { eventId } = req.params;

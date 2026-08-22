@@ -1,14 +1,14 @@
 // savings-admin-routes.js
-// Admin "Savings Management" API — same gating as every other
-// /api/sys/* route (authenticate + authorizeAdmin; granular permission
-// enforcement stays client-side via admin-permissions.js).
+// Admin "Savings Management" API. Coarse gating (authenticate +
+// authorizeAdmin) happens at the mount point in index.js. Granular
+// per-action enforcement is done HERE via requirePermission(), matching
+// admin-permissions.js's ACTIONS_REGISTRY under "savings-management" 1:1.
 //
 // Mount in index.js:
-//   const savingsAdminRouter = require("./savings-admin-routes");
+//   const savingsAdminRouter = require("./savings-admin-routes")(requirePermission);
 //   app.use("/api/sys/savings", authenticate, authorizeAdmin, savingsAdminRouter);
 
 const express = require("express");
-const router = express.Router();
 const savingsAdmin = require("./savings-admin-service");
 
 function handleError(res, err, fallbackMessage) {
@@ -30,112 +30,121 @@ function handleError(res, err, fallbackMessage) {
   res.status(500).json({ success: false, error: fallbackMessage });
 }
 
-// ---------------- Products ----------------
-router.get("/products", async (req, res) => {
-  try {
-    res.json({ success: true, data: await savingsAdmin.listProducts() });
-  } catch (err) {
-    handleError(res, err, "Failed to load savings products");
-  }
-});
+module.exports = function (requirePermission) {
+  const router = express.Router();
+  const perm = (actionId) => requirePermission(`savings-management:${actionId}`);
 
-router.get("/products/:id", async (req, res) => {
-  try {
-    res.json({
-      success: true,
-      data: await savingsAdmin.getProduct(req.params.id),
-    });
-  } catch (err) {
-    handleError(res, err, "Failed to load savings product");
-  }
-});
+  // ---------------- Products ----------------
+  router.get("/products", perm("view-products"), async (req, res) => {
+    try {
+      res.json({ success: true, data: await savingsAdmin.listProducts() });
+    } catch (err) {
+      handleError(res, err, "Failed to load savings products");
+    }
+  });
 
-router.post("/products", async (req, res) => {
-  try {
-    res.json({
-      success: true,
-      data: await savingsAdmin.createGenericProduct(req.user.id, req, req.body),
-    });
-  } catch (err) {
-    handleError(res, err, "Failed to create savings product");
-  }
-});
+  router.get("/products/:id", perm("view-products"), async (req, res) => {
+    try {
+      res.json({
+        success: true,
+        data: await savingsAdmin.getProduct(req.params.id),
+      });
+    } catch (err) {
+      handleError(res, err, "Failed to load savings product");
+    }
+  });
 
-router.put("/products/:id", async (req, res) => {
-  try {
-    res.json({
-      success: true,
-      data: await savingsAdmin.updateProduct(
-        req.user.id,
-        req,
-        req.params.id,
-        req.body,
-      ),
-    });
-  } catch (err) {
-    handleError(res, err, "Failed to update savings product");
-  }
-});
+  router.post("/products", perm("create-products"), async (req, res) => {
+    try {
+      res.json({
+        success: true,
+        data: await savingsAdmin.createGenericProduct(req.user.id, req, req.body),
+      });
+    } catch (err) {
+      handleError(res, err, "Failed to create savings product");
+    }
+  });
 
-router.delete("/products/:id", async (req, res) => {
-  try {
-    res.json({
-      success: true,
-      data: await savingsAdmin.deleteProduct(req.user.id, req, req.params.id),
-    });
-  } catch (err) {
-    handleError(res, err, "Failed to delete savings product");
-  }
-});
+  router.put("/products/:id", perm("edit-products"), async (req, res) => {
+    try {
+      res.json({
+        success: true,
+        data: await savingsAdmin.updateProduct(
+          req.user.id,
+          req,
+          req.params.id,
+          req.body,
+        ),
+      });
+    } catch (err) {
+      handleError(res, err, "Failed to update savings product");
+    }
+  });
 
-// ---------------- Status copy ----------------
-router.get("/products/:id/status-copy", async (req, res) => {
-  try {
-    res.json({
-      success: true,
-      data: await savingsAdmin.listStatusCopy(req.params.id),
-    });
-  } catch (err) {
-    handleError(res, err, "Failed to load status copy");
-  }
-});
+  router.delete("/products/:id", perm("delete-products"), async (req, res) => {
+    try {
+      res.json({
+        success: true,
+        data: await savingsAdmin.deleteProduct(req.user.id, req, req.params.id),
+      });
+    } catch (err) {
+      handleError(res, err, "Failed to delete savings product");
+    }
+  });
 
-router.post("/status-copy", async (req, res) => {
-  try {
-    res.json({
-      success: true,
-      data: await savingsAdmin.upsertStatusCopy(req.user.id, req, req.body),
-    });
-  } catch (err) {
-    handleError(res, err, "Failed to update status copy");
-  }
-});
+  // ---------------- Status copy ----------------
+  router.get(
+    "/products/:id/status-copy",
+    perm("view-products"),
+    async (req, res) => {
+      try {
+        res.json({
+          success: true,
+          data: await savingsAdmin.listStatusCopy(req.params.id),
+        });
+      } catch (err) {
+        handleError(res, err, "Failed to load status copy");
+      }
+    },
+  );
 
-// ---------------- Global kill switch ----------------
-router.get("/enabled", async (req, res) => {
-  try {
-    res.json({
-      success: true,
-      data: { savings_enabled: await savingsAdmin.getSavingsEnabled() },
-    });
-  } catch (err) {
-    handleError(res, err, "Failed to load savings enabled status");
-  }
-});
+  router.post("/status-copy", perm("edit-status-copy"), async (req, res) => {
+    try {
+      res.json({
+        success: true,
+        data: await savingsAdmin.upsertStatusCopy(req.user.id, req, req.body),
+      });
+    } catch (err) {
+      handleError(res, err, "Failed to update status copy");
+    }
+  });
 
-router.post("/enabled", async (req, res) => {
-  try {
-    res.json({
-      success: true,
-      data: await savingsAdmin.setSavingsEnabled(
-        req.user.id,
-        req,
-        req.body.enabled,
-      ),
-    });
-  } catch (err) {
-    handleError(res, err, "Failed to update savings enabled status");
-  }
-});
+  // ---------------- Global kill switch ----------------
+  router.get("/enabled", perm("view-products"), async (req, res) => {
+    try {
+      res.json({
+        success: true,
+        data: { savings_enabled: await savingsAdmin.getSavingsEnabled() },
+      });
+    } catch (err) {
+      handleError(res, err, "Failed to load savings enabled status");
+    }
+  });
 
-module.exports = router;
+  router.post("/enabled", perm("toggle-savings-enabled"), async (req, res) => {
+    try {
+      res.json({
+        success: true,
+        data: await savingsAdmin.setSavingsEnabled(
+          req.user.id,
+          req,
+          req.body.enabled,
+        ),
+      });
+    } catch (err) {
+      handleError(res, err, "Failed to update savings enabled status");
+    }
+  });
+
+  return router;
+};

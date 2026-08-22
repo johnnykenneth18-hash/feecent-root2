@@ -93,6 +93,86 @@ const authorizeAdmin = async (req, res, next) => {
   return res.status(403).json({ error: "Access denied. Admin only." });
 };
 
+// Strictly requires role === 'super_admin'. Deliberately separate from
+// authorizeAdmin (which allows both admin and super_admin) — use this
+// on operations even a fully-permissioned Admin should never be able to
+// do, e.g. granting/changing/revoking admin access itself. Never derive
+// this from req.body or any client-supplied value — always req.user.role,
+// which authenticate() just re-read from the DB this request.
+const requireSuperAdmin = (req, res, next) => {
+  if (!req.user || req.user.role !== "super_admin") {
+    return res.status(403).json({
+      error: "This action requires super admin access.",
+      code: "SUPER_ADMIN_REQUIRED",
+    });
+  }
+  next();
+};
+
+// ==================== SERVER-SIDE RBAC ENFORCEMENT ====================
+// Mirrors the permission keys defined in admin-permissions.js's
+// ACTIONS_REGISTRY on the frontend ("section:actionId", e.g.
+// "users:freeze-user"). The two lists are kept in sync by convention —
+// whenever a new action id is added client-side to gate a button, the
+// matching route(s) it calls must get requirePermission(...) with the
+// same key server-side. The client list controls what admins SEE; this
+// is what actually controls what they can DO.
+//
+// This deliberately does not do its own DB read: authenticate() already
+// fetched the full user row (role, admin_role, admin_permissions) fresh
+// off Postgres this request (5s cache, explicitly invalidated the instant
+// any of those fields changes via bumpUserCacheVersion), so req.user is
+// already trustworthy and current. No client-supplied header, key, or
+// body field is ever consulted for the authorization decision.
+function requirePermission(permissionKey) {
+  return (req, res, next) => {
+    const user = req.user;
+    if (!user) {
+      return res.status(401).json({ error: "Please authenticate" });
+    }
+
+    // Super admin: full access, always.
+    if (user.role === "super_admin") {
+      return next();
+    }
+
+    // Anything below "admin" never reaches action-level checks.
+    if (user.role !== "admin") {
+      return res.status(403).json({ error: "Access denied. Admin only." });
+    }
+
+    // Admin with no role/permission set assigned yet -> deny by default,
+    // not "deny only what's explicitly listed as missing."
+    let permissions = user.admin_permissions;
+    if (typeof permissions === "string") {
+      try {
+        permissions = JSON.parse(permissions);
+      } catch (e) {
+        permissions = null;
+      }
+    }
+
+    const [section, actionId] = permissionKey.split(":");
+    const allowed =
+      !!permissions &&
+      Array.isArray(permissions.actions?.[section]) &&
+      permissions.actions[section].includes(actionId);
+
+    if (!allowed) {
+      console.warn(
+        `[RBAC] Denied: admin ${user.id} (${user.admin_role || "no role"}) lacks "${permissionKey}" on ${req.method} ${req.originalUrl}`,
+      );
+      return res.status(403).json({
+        error: `You don't have permission to perform this action.`,
+        code: "PERMISSION_DENIED",
+        required: permissionKey,
+      });
+    }
+
+    next();
+  };
+}
+
 // Check if account is frozen
 const checkAccountFrozen = async (req, res, next) => {
   if (req.user.is_frozen) {
@@ -286,6 +366,13 @@ function generateSessionId() {
   return `${userId.substring(0, 8)}_${timestamp}_${random}_${version}`;
 }*/
 
+function hashTransferContext(fromAccountId, toAccountNumber, amount) {
+  return crypto
+    .createHash("sha256")
+    .update(`${fromAccountId}:${toAccountNumber}:${amount}`)
+    .digest("hex");
+}
+
 // Get device info for tracking
 function getDeviceInfo(req) {
   const userAgent = req.headers["user-agent"] || "Unknown";
@@ -465,86 +552,6 @@ async function createUserSession(userId, token, deviceInfo) {
     throw error;
   }
 }
-
-// ==================== FIXED: MIDDLEWARE - Check Single Device Session ====================
-
-/*const checkSingleDeviceSession = async (req, res, next) => {
-  try {
-    const authHeader = req.header("Authorization");
-    const token = authHeader?.replace("Bearer ", "");
-
-    if (!token) {
-      return res.status(401).json({ error: "Please authenticate" });
-    }
-
-    let decoded;
-    try {
-      decoded = jwt.verify(token, process.env.JWT_SECRET);
-    } catch (jwtError) {
-      return res.status(401).json({ error: "Invalid token" });
-    }
-
-    const { data: user, error: userError } = await supabase
-      .from("users")
-      .select("id, active_session_id, is_active, is_frozen, last_active_device")
-      .eq("id", decoded.userId)
-      .single();
-
-    if (userError || !user) {
-      return res.status(401).json({ error: "User not found" });
-    }
-
-    if (!user.is_active) {
-      return res.status(401).json({ error: "Account deactivated" });
-    }
-
-    // Only enforce single-device when BOTH the token AND the DB have a sessionId.
-    // If either is missing, allow through — never false-logout during transitions.
-    if (decoded.sessionId && user.active_session_id) {
-      if (user.active_session_id !== decoded.sessionId) {
-        console.log(
-          `[Session Middleware] MISMATCH: DB=${user.active_session_id}, Token=${decoded.sessionId}`,
-        );
-
-        await supabase
-          .from("user_sessions")
-          .update({
-            is_active: false,
-            is_current: false,
-            invalidated_reason: "New login from another device",
-          })
-          .eq("session_token", token);
-
-        return res.status(401).json({
-          error: "session_expired",
-          message:
-            "You have been logged out because a new login was detected on another device.",
-          code: "SESSION_REPLACED",
-          device_name: user.last_active_device || "Another device",
-        });
-      }
-    }
-
-    // Update last activity
-    if (decoded.sessionId) {
-      await supabase
-        .from("user_sessions")
-        .update({ last_activity: new Date().toISOString() })
-        .eq("session_token", token)
-        .eq("is_active", true);
-    }
-
-    req.user = user;
-    req.token = token;
-    req.sessionId = decoded.sessionId;
-    next();
-  } catch (error) {
-    console.error("[Session Middleware] Error:", error.message);
-    res.status(401).json({ error: "Please authenticate" });
-  }
-};*/
-
-// auth.js - REPLACE the entire checkSingleDeviceSession function
 
 const checkSingleDeviceSession = async (req, res, next) => {
   try {
@@ -823,6 +830,8 @@ async function revokeCurrentSession(userId, sessionId, token) {
 module.exports = {
   authenticate,
   authorizeAdmin,
+  requireSuperAdmin,
+  requirePermission,
   checkAccountFrozen,
   logAdminAction,
   otpRateLimiter,
@@ -839,4 +848,5 @@ module.exports = {
   revokeSession,
   revokeCurrentSession, // Add this
   generateSessionId,
+  hashTransferContext,
 };
