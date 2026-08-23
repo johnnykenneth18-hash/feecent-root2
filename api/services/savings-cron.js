@@ -1105,6 +1105,16 @@ async function addToRetryQueue(userId, savingsId, savingsType, amount) {
   });
 }
 
+// FIX (Aug 2026): the old version of this function debited the user's
+// account for every queued failure without ever re-checking whether the
+// plan was STILL active/auto_save — so a deduction that failed once (low
+// balance) would keep silently charging the user for up to 5 more days
+// even after the plan completed, matured, was cancelled, or the user
+// turned auto-save off. It also never updated the plan's own
+// current_saved/days_completed, so the charge didn't even count toward
+// the goal. Now it re-fetches the LIVE plan and re-runs the same
+// per-type deduction function the daily cron uses, after gating on
+// status + auto_save.
 async function retryFailedDeductions() {
   const today = new Date();
   today.setHours(0, 0, 0, 0);
@@ -1122,70 +1132,135 @@ async function retryFailedDeductions() {
     return;
   }
 
-  for (const item of failedItems || []) {
-    const { data: account, error: accError } = await supabase
-      .from("accounts")
-      .select("*")
-      .eq("user_id", item.user_id)
-      .eq("account_type", "checking")
-      .single();
-
-    if (accError || !account) continue;
-
-    if (account.available_balance >= item.amount) {
-      const newBalance = account.balance - item.amount;
-      const newAvailable = account.available_balance - item.amount;
-
-      await supabase
-        .from("accounts")
-        .update({ balance: newBalance, available_balance: newAvailable })
-        .eq("id", account.id);
-
-      const retryDescription = `${item.savings_type.charAt(0).toUpperCase() + item.savings_type.slice(1)} Savings Deposit (retry)`;
-      const { data: txRecord, error: txError } = await supabase
-        .from("transactions_new")
-        .insert({
-          sender_account_id: account.id,
-          sender_user_id: item.user_id,
-          amount: item.amount,
-          description: retryDescription,
-          transaction_type: "savings",
-          status: "completed",
-          completed_at: new Date().toISOString(),
-        })
-        .select("transaction_reference")
+  const REFETCHERS = {
+    harvest: async (id, userId) => {
+      const { data } = await supabase
+        .from("user_harvest_enrollments")
+        .select(
+          "*, users!inner(id, email, first_name, last_name, is_frozen), harvest_plans!inner(daily_amount, duration_days, name, reward_items)",
+        )
+        .eq("id", id)
+        .eq("user_id", userId)
         .single();
+      return data;
+    },
+    fixed: async (id, userId) => {
+      const { data } = await supabase
+        .from("fixed_savings")
+        .select("*, users!inner(id, email, first_name, last_name, is_frozen)")
+        .eq("id", id)
+        .eq("user_id", userId)
+        .single();
+      return data;
+    },
+    savebox: async (id, userId) => {
+      const { data } = await supabase
+        .from("savebox_savings")
+        .select("*, users!inner(id, email, first_name, last_name, is_frozen)")
+        .eq("id", id)
+        .eq("user_id", userId)
+        .single();
+      return data;
+    },
+    target: async (id, userId) => {
+      const { data } = await supabase
+        .from("target_savings")
+        .select("*, users!inner(id, email, first_name, last_name, is_frozen)")
+        .eq("id", id)
+        .eq("user_id", userId)
+        .single();
+      return data;
+    },
+    // Generic (admin-defined) plans queue deductions the same way but
+    // live in savings-generic-engine.js, which already requires THIS
+    // file at module load — requiring it back here at the top would be a
+    // circular require. It's lazy-required below, at call time, once
+    // both modules are already fully loaded.
+    generic: async (id, userId) => {
+      const { data } = await supabase
+        .from("savings_enrollments")
+        .select("*, savings_products(name, reward_type)")
+        .eq("id", id)
+        .eq("user_id", userId)
+        .single();
+      return data;
+    },
+  };
 
-      if (txError) {
-        console.error("Retry transaction creation error:", txError);
-      } else {
-        await recordLedgerEntry({
-          transactionReference: txRecord.transaction_reference,
-          userId: item.user_id,
-          accountId: account.id,
-          entryType: "DEBIT",
-          amount: item.amount,
-          balanceBefore: account.balance,
-          balanceAfter: newBalance,
-          description: retryDescription,
-        });
-      }
+  const PROCESSORS = {
+    harvest: processSingleHarvestDeduction,
+    fixed: processSingleFixedDeduction,
+    savebox: processSingleSaveboxDeduction,
+    target: processSingleTargetDeduction,
+  };
 
+  for (const item of failedItems || []) {
+    const refetch = REFETCHERS[item.savings_type];
+
+    // Unknown/unsupported type in the queue (e.g. spare_change, which
+    // has no cron auto-deduction at all) — never blindly charge for it.
+    if (!refetch) {
+      await supabase
+        .from("savings_deduction_queue")
+        .update({ status: "cancelled" })
+        .eq("id", item.id);
+      continue;
+    }
+
+    const plan = await refetch(item.savings_id, item.user_id);
+
+    // CRITICAL GATE: this failure could be days old. If the plan is no
+    // longer active, or auto-save was turned off since it was queued,
+    // stop here — don't touch the user's money.
+    if (!plan || plan.status !== "active" || plan.auto_save !== true) {
+      await supabase
+        .from("savings_deduction_queue")
+        .update({ status: "cancelled" })
+        .eq("id", item.id);
+      console.log(
+        `Retry cancelled for ${item.savings_type} ${item.savings_id} — plan no longer active/auto_save`,
+      );
+      continue;
+    }
+
+    let processor = PROCESSORS[item.savings_type];
+    if (item.savings_type === "generic") {
+      processor = require("./savings-generic-engine").processSingleDeduction;
+    }
+
+    try {
+      await processor(plan);
       await supabase
         .from("savings_deduction_queue")
         .update({ status: "completed" })
         .eq("id", item.id);
-
       console.log(
         `Retry successful for ${item.savings_type} savings, user ${item.user_id}`,
       );
-    } else {
+    } catch (err) {
+      console.error(`Retry deduction failed for queue item ${item.id}:`, err);
       await supabase
         .from("savings_deduction_queue")
         .update({ attempts: item.attempts + 1 })
         .eq("id", item.id);
     }
   }
+}
+
+// Cancel any pending retry-queue items for a plan. Call this whenever a
+// plan stops being eligible for auto-deduction (cancelled, auto-save
+// toggled off, or completed) so a failure queued BEFORE that change can
+// never silently fire and charge the user afterward. retryFailedDeductions
+// above already re-checks live status as a second layer of defense, but
+// purging here means the queue reflects reality immediately rather than
+// leaving a "pending" row that will just get cancelled on its next run.
+async function cancelPendingDeductions(savingsType, savingsId) {
+  await supabase
+    .from("savings_deduction_queue")
+    .update({ status: "cancelled" })
+    .eq("savings_type", savingsType)
+    .eq("savings_id", savingsId)
+    .eq("status", "pending");
 }
 
 async function logFailedDeduction(userId, savingsId, savingsType, amount) {
@@ -1359,4 +1434,8 @@ module.exports = {
   // ledger-recording function rather than a second copy of it, so the
   // two engines can never drift apart on how a ledger entry is shaped.
   recordLedgerEntry,
+  // Exported for index.js's toggle-auto/cancel routes, so turning off
+  // auto-save purges any stale queued retry immediately instead of
+  // waiting for retryFailedDeductions' own status check to catch it.
+  cancelPendingDeductions,
 };

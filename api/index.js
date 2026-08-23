@@ -9864,6 +9864,19 @@ app.post(
 
       if (error) throw error;
 
+      // FIX (Aug 2026): if auto-save was just turned off, purge any
+      // pending retry-queue rows for this plan immediately. Without
+      // this, a deduction that failed (low balance) BEFORE the toggle
+      // could still fire up to 5 more days later, ignoring the toggle.
+      if (auto_save === false) {
+        await supabase
+          .from("savings_deduction_queue")
+          .update({ status: "cancelled" })
+          .eq("savings_type", type)
+          .eq("savings_id", id)
+          .eq("status", "pending");
+      }
+
       res.json({
         success: true,
         message: auto_save ? "Auto-save enabled" : "Auto-save disabled",
@@ -10540,6 +10553,16 @@ app.post(
         .eq("user_id", req.user.id);
 
       if (error) throw error;
+
+      // FIX (Aug 2026): same purge as toggle-auto — a plan that was
+      // cancelled shouldn't still get charged by a stale queued retry
+      // from a failure that happened before cancellation.
+      await supabase
+        .from("savings_deduction_queue")
+        .update({ status: "cancelled" })
+        .eq("savings_type", type)
+        .eq("savings_id", id)
+        .eq("status", "pending");
 
       res.json({
         success: true,

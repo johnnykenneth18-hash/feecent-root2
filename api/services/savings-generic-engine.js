@@ -454,4 +454,8 @@ module.exports = {
   createEnrollment,
   processGenericSavings,
   processWithdrawal,
+  // Exported so savings-cron.js's retryFailedDeductions() can lazy-
+  // require it when reprocessing a queued generic-plan deduction,
+  // instead of leaving the retry queue to silently skip generic plans.
+  processSingleDeduction,
 };
