@@ -100,6 +100,9 @@ const pinVerifyLimiter = rateLimit({
   keyGenerator: (req) => `${req.ip}:${req.user?.id || "anon"}`,
 });
 
+const frozylaWebhookRouter = require("./frozyla-webhook-routes");
+app.use("/api/webhooks/frozyla", frozylaWebhookRouter);
+
 // SECURITY FIX (Critical): registration and staff-ID verification had no
 // rate limiting at all, making them viable brute-force / enumeration and
 // account-takeover targets.
@@ -1099,11 +1102,20 @@ function mapStatus(code) {
 function errCode(err) {
   const msg = (err && err.message) || "";
   const known = [
-    "invalid_amount", "account_not_found", "insufficient_funds",
-    "duplicate_active_plan", "plan_not_found", "invalid_or_expired_pin_token",
-    "savings_plan_not_found", "already_withdrawn", "not_matured",
-    "target_not_reached", "no_funds_to_withdraw", "invalid_savings_type",
-    "invalid_or_expired_otp", "invalid_action",
+    "invalid_amount",
+    "account_not_found",
+    "insufficient_funds",
+    "duplicate_active_plan",
+    "plan_not_found",
+    "invalid_or_expired_pin_token",
+    "savings_plan_not_found",
+    "already_withdrawn",
+    "not_matured",
+    "target_not_reached",
+    "no_funds_to_withdraw",
+    "invalid_savings_type",
+    "invalid_or_expired_otp",
+    "invalid_action",
   ];
   return known.find((c) => msg.includes(c)) || null;
 }
@@ -1112,9 +1124,11 @@ const FRIENDLY = {
   invalid_amount: "Invalid amount",
   account_not_found: "Account not found",
   insufficient_funds: "Insufficient funds",
-  duplicate_active_plan: "You already have an active plan of this type. Complete or withdraw it before starting a new one.",
+  duplicate_active_plan:
+    "You already have an active plan of this type. Complete or withdraw it before starting a new one.",
   plan_not_found: "Savings plan not found",
-  invalid_or_expired_pin_token: "Invalid or expired PIN verification. Please try again.",
+  invalid_or_expired_pin_token:
+    "Invalid or expired PIN verification. Please try again.",
   savings_plan_not_found: "Savings plan not found",
   already_withdrawn: "This plan has already been withdrawn",
   not_matured: "Savings not yet matured",
@@ -1272,7 +1286,12 @@ app.use(
   serviceRegistryAdminRouter,
 );
 
-app.use("/api/sys/vat-config", authenticate, authorizeAdmin, vatAdminRouter(requirePermission));
+app.use(
+  "/api/sys/vat-config",
+  authenticate,
+  authorizeAdmin,
+  vatAdminRouter(requirePermission),
+);
 
 // ==================== SECURITY MONITORING ENDPOINTS ====================
 // Log security events
@@ -7878,7 +7897,12 @@ const billsWorker = require("../lib/bills-worker");
 
 app.use("/api/bills", authenticate, billsCatalogRouter);
 
-app.use("/api/sys/bills", authenticate, authorizeAdmin, billsAdminRouter(requirePermission));
+app.use(
+  "/api/sys/bills",
+  authenticate,
+  authorizeAdmin,
+  billsAdminRouter(requirePermission),
+);
 
 app.post(
   "/api/user/bills/verify-pin",
@@ -8921,7 +8945,10 @@ app.post(
   authenticate,
   checkAccountFrozen,
   async (req, res) => {
-    const requestId = req.headers["idempotency-key"] || req.body.requestId || crypto.randomUUID();
+    const requestId =
+      req.headers["idempotency-key"] ||
+      req.body.requestId ||
+      crypto.randomUUID();
 
     try {
       const { amount, account_id, otp_code, bank_details } = req.body;
@@ -8937,7 +8964,8 @@ app.post(
 
       if (error) {
         const code = errCode(error);
-        if (code) return res.status(mapStatus(code)).json({ error: FRIENDLY[code] });
+        if (code)
+          return res.status(mapStatus(code)).json({ error: FRIENDLY[code] });
         console.error("Withdrawal error:", error);
         return res.status(500).json({ error: "Withdrawal failed" });
       }
@@ -8963,12 +8991,15 @@ app.post(
       const { from_account_id, amount, source_transaction_id } = req.body;
       const requestId = source_transaction_id || crypto.randomUUID();
 
-      const { data, error } = await supabase.rpc("process_spare_change_deposit", {
-        p_request_id: requestId,
-        p_user_id: req.user.id,
-        p_account_id: from_account_id,
-        p_transfer_amount: amount,
-      });
+      const { data, error } = await supabase.rpc(
+        "process_spare_change_deposit",
+        {
+          p_request_id: requestId,
+          p_user_id: req.user.id,
+          p_account_id: from_account_id,
+          p_transfer_amount: amount,
+        },
+      );
 
       if (error) {
         console.error("Spare change processing error:", error);
@@ -8979,7 +9010,9 @@ app.post(
         return res.json({ saved_amount: 0 });
       }
 
-      console.log(`Spare change saved: ₦${data.saved_amount.toFixed(2)} for user ${req.user.id}`);
+      console.log(
+        `Spare change saved: ₦${data.saved_amount.toFixed(2)} for user ${req.user.id}`,
+      );
 
       res.json({
         success: true,
@@ -9509,8 +9542,17 @@ app.post(
   authenticate,
   checkAccountFrozen,
   async (req, res) => {
-    const { type, amount, plan_id, target_withdrawal_date, auto_save = true } = req.body;
-    const requestId = req.headers["idempotency-key"] || req.body.requestId || crypto.randomUUID();
+    const {
+      type,
+      amount,
+      plan_id,
+      target_withdrawal_date,
+      auto_save = true,
+    } = req.body;
+    const requestId =
+      req.headers["idempotency-key"] ||
+      req.body.requestId ||
+      crypto.randomUUID();
 
     try {
       let rpcName, rpcArgs;
@@ -9518,29 +9560,54 @@ app.post(
       switch (type) {
         case "harvest":
           rpcName = "start_harvest_savings";
-          rpcArgs = { p_request_id: requestId, p_user_id: req.user.id, p_plan_id: plan_id, p_amount: amount, p_auto_save: auto_save };
+          rpcArgs = {
+            p_request_id: requestId,
+            p_user_id: req.user.id,
+            p_plan_id: plan_id,
+            p_amount: amount,
+            p_auto_save: auto_save,
+          };
           break;
         case "fixed":
           rpcName = "start_fixed_savings";
-          rpcArgs = { p_request_id: requestId, p_user_id: req.user.id, p_amount: amount, p_auto_save: auto_save };
+          rpcArgs = {
+            p_request_id: requestId,
+            p_user_id: req.user.id,
+            p_amount: amount,
+            p_auto_save: auto_save,
+          };
           break;
         case "savebox":
           rpcName = "start_savebox_savings";
-          rpcArgs = { p_request_id: requestId, p_user_id: req.user.id, p_amount: amount, p_auto_save: auto_save };
+          rpcArgs = {
+            p_request_id: requestId,
+            p_user_id: req.user.id,
+            p_amount: amount,
+            p_auto_save: auto_save,
+          };
           break;
         case "target":
           if (!target_withdrawal_date) {
-            return res.status(400).json({ error: "target_withdrawal_date is required" });
+            return res
+              .status(400)
+              .json({ error: "target_withdrawal_date is required" });
           }
           rpcName = "start_target_savings";
           rpcArgs = {
-            p_request_id: requestId, p_user_id: req.user.id, p_amount: amount,
-            p_target_withdrawal_date: target_withdrawal_date, p_auto_save: auto_save,
+            p_request_id: requestId,
+            p_user_id: req.user.id,
+            p_amount: amount,
+            p_target_withdrawal_date: target_withdrawal_date,
+            p_auto_save: auto_save,
           };
           break;
         case "spare_change":
           rpcName = "start_spare_change_savings";
-          rpcArgs = { p_request_id: requestId, p_user_id: req.user.id, p_auto_save: auto_save };
+          rpcArgs = {
+            p_request_id: requestId,
+            p_user_id: req.user.id,
+            p_auto_save: auto_save,
+          };
           break;
         default:
           return res.status(400).json({ error: "Invalid savings type" });
@@ -9549,19 +9616,32 @@ app.post(
       const { data, error } = await supabase.rpc(rpcName, rpcArgs);
       if (error) {
         const code = errCode(error);
-        if (code) return res.status(mapStatus(code)).json({ error: FRIENDLY[code] });
+        if (code)
+          return res.status(mapStatus(code)).json({ error: FRIENDLY[code] });
         console.error("Error starting savings:", error);
-        return res.status(500).json({ error: "Failed to start savings: " + error.message });
+        return res
+          .status(500)
+          .json({ error: "Failed to start savings: " + error.message });
       }
 
       if (data.duplicate) {
-        return res.json({ success: true, message: "Savings started successfully", duplicate: true });
+        return res.json({
+          success: true,
+          message: "Savings started successfully",
+          duplicate: true,
+        });
       }
 
-      res.json({ success: true, message: "Savings started successfully", savings: data.savings });
+      res.json({
+        success: true,
+        message: "Savings started successfully",
+        savings: data.savings,
+      });
     } catch (error) {
       console.error("Error starting savings:", error);
-      res.status(500).json({ error: "Failed to start savings: " + error.message });
+      res
+        .status(500)
+        .json({ error: "Failed to start savings: " + error.message });
     }
   },
 );
@@ -10458,11 +10538,16 @@ app.post(
   async (req, res) => {
     const { type, id } = req.params;
     const { savings_auth_token } = req.body;
-    const requestId = req.headers["idempotency-key"] || req.body.requestId || crypto.randomUUID();
+    const requestId =
+      req.headers["idempotency-key"] ||
+      req.body.requestId ||
+      crypto.randomUUID();
 
     try {
       if (!savings_auth_token) {
-        return res.status(400).json({ error: "PIN verification required before withdrawal" });
+        return res
+          .status(400)
+          .json({ error: "PIN verification required before withdrawal" });
       }
 
       const savingsContextHash = crypto
@@ -10481,13 +10566,20 @@ app.post(
 
       if (error) {
         const code = errCode(error);
-        if (code) return res.status(mapStatus(code)).json({ error: FRIENDLY[code] });
+        if (code)
+          return res.status(mapStatus(code)).json({ error: FRIENDLY[code] });
         console.error("Withdrawal error:", error);
-        return res.status(500).json({ error: "Failed to process withdrawal: " + error.message });
+        return res
+          .status(500)
+          .json({ error: "Failed to process withdrawal: " + error.message });
       }
 
       if (data.duplicate) {
-        return res.json({ success: true, message: "Withdrawal completed successfully", duplicate: true });
+        return res.json({
+          success: true,
+          message: "Withdrawal completed successfully",
+          duplicate: true,
+        });
       }
 
       // Notification stays in JS — unchanged from the old route.
@@ -10508,7 +10600,9 @@ app.post(
       });
     } catch (error) {
       console.error("Withdrawal error:", error);
-      res.status(500).json({ error: "Failed to process withdrawal: " + error.message });
+      res
+        .status(500)
+        .json({ error: "Failed to process withdrawal: " + error.message });
     }
   },
 );
@@ -14991,7 +15085,12 @@ app.post(
   },
 );
 
-app.use("/api/sys/savings", authenticate, authorizeAdmin, savingsAdminRouter(requirePermission));
+app.use(
+  "/api/sys/savings",
+  authenticate,
+  authorizeAdmin,
+  savingsAdminRouter(requirePermission),
+);
 
 app.use("/api/user/savings/catalog", authenticate, savingsCatalogRouter);
 
@@ -15003,7 +15102,12 @@ app.use("/api/user/savings/status", authenticate, savingsStatusRouter);
 app.use("/api/support", authenticate, supportRoutes);
 
 // Admin support queue + bot topic management
-app.use("/api/sys/support", authenticate, authorizeAdmin, supportAdminRoutes(requirePermission));
+app.use(
+  "/api/sys/support",
+  authenticate,
+  authorizeAdmin,
+  supportAdminRoutes(requirePermission),
+);
 
 // ==================== USER ACCOUNT CLOSURE ROUTES ====================
 
@@ -15258,10 +15362,6 @@ app.delete(
   },
 );
 
-
-
-
-
 // ============================================================
 // GET FLUTTERWAVE BANKS
 // ============================================================
@@ -15301,21 +15401,21 @@ app.post(
       // instead of resolving to a single (possibly wrong) bank on the
       // sender's behalf.
       const resolution = await accountResolutionCache.resolveAccount({
-  accountNumber: account_number,
-  bankCode: bank_code || null,
-  bankName: bank_name || null,
-  userId: req.user.id,
-  maxResults: 4,
-});
+        accountNumber: account_number,
+        bankCode: bank_code || null,
+        bankName: bank_name || null,
+        userId: req.user.id,
+        maxResults: 4,
+      });
 
       if (resolution.found) {
         // Record the hit for analytics
         if (resolution.results.length > 0) {
-  accountResolutionCache.recordHit(
-    account_number,
-    resolution.results[0].bank_name,
-  );
-}
+          accountResolutionCache.recordHit(
+            account_number,
+            resolution.results[0].bank_name,
+          );
+        }
 
         return res.json({
           success: true,
@@ -15323,7 +15423,8 @@ app.post(
           results: resolution.results,
           // bank_code/bank_name unset in the request AND more than one
           // bank matched = the frontend shows bank chips, not a name.
-          multiple_banks: !bank_code && !bank_name && resolution.results.length > 1,
+          multiple_banks:
+            !bank_code && !bank_name && resolution.results.length > 1,
         });
       }
 
@@ -15333,8 +15434,7 @@ app.post(
         return res.json({
           success: false,
           needs_bank_selection: true,
-          message:
-            "Please select a bank to verify this account number.",
+          message: "Please select a bank to verify this account number.",
         });
       }
 
@@ -15375,114 +15475,94 @@ app.post(
 );
 
 // ── GET USER BENEFICIARIES (for transfer form) ─────────────────────
-app.get(
-  "/api/user/beneficiaries",
-  authenticate,
-  async (req, res) => {
-    try {
-      const { limit = 10 } = req.query;
-      const beneficiaries =
-        await accountResolutionCache.getRecentBeneficiaries(
-          req.user.id,
-          parseInt(limit),
-        );
-      res.json({ success: true, beneficiaries });
-    } catch (error) {
-      console.error("[Beneficiaries] Error:", error);
-      res.status(500).json({ error: "Failed to load beneficiaries" });
-    }
-  },
-);
+app.get("/api/user/beneficiaries", authenticate, async (req, res) => {
+  try {
+    const { limit = 10 } = req.query;
+    const beneficiaries = await accountResolutionCache.getRecentBeneficiaries(
+      req.user.id,
+      parseInt(limit),
+    );
+    res.json({ success: true, beneficiaries });
+  } catch (error) {
+    console.error("[Beneficiaries] Error:", error);
+    res.status(500).json({ error: "Failed to load beneficiaries" });
+  }
+});
 
 // ── SAVE/PIN BENEFICIARY ───────────────────────────────────────────
-app.post(
-  "/api/user/beneficiaries",
-  authenticate,
-  async (req, res) => {
-    try {
-      const {
-        beneficiary_name,
-        account_number,
-        bank_code,
-        bank_name,
-        beneficiary_type = "external",
-        is_pinned = false,
-      } = req.body;
+app.post("/api/user/beneficiaries", authenticate, async (req, res) => {
+  try {
+    const {
+      beneficiary_name,
+      account_number,
+      bank_code,
+      bank_name,
+      beneficiary_type = "external",
+      is_pinned = false,
+    } = req.body;
 
-      if (!beneficiary_name || !account_number || !bank_code) {
-        return res.status(400).json({ error: "Missing required fields" });
-      }
-
-      const result = await accountResolutionCache.saveBeneficiary({
-        userId: req.user.id,
-        beneficiaryName: beneficiary_name,
-        accountNumber: account_number,
-        bankCode: bank_code,
-        bankName: bank_name,
-        beneficiaryType: beneficiary_type,
-        verificationSource: "manual",
-      });
-
-      if (!result.success) {
-        return res.status(500).json({ error: result.error });
-      }
-
-      res.json({ success: true, message: "Beneficiary saved" });
-    } catch (error) {
-      console.error("[Save Beneficiary] Error:", error);
-      res.status(500).json({ error: "Failed to save beneficiary" });
+    if (!beneficiary_name || !account_number || !bank_code) {
+      return res.status(400).json({ error: "Missing required fields" });
     }
-  },
-);
 
+    const result = await accountResolutionCache.saveBeneficiary({
+      userId: req.user.id,
+      beneficiaryName: beneficiary_name,
+      accountNumber: account_number,
+      bankCode: bank_code,
+      bankName: bank_name,
+      beneficiaryType: beneficiary_type,
+      verificationSource: "manual",
+    });
 
+    if (!result.success) {
+      return res.status(500).json({ error: result.error });
+    }
 
+    res.json({ success: true, message: "Beneficiary saved" });
+  } catch (error) {
+    console.error("[Save Beneficiary] Error:", error);
+    res.status(500).json({ error: "Failed to save beneficiary" });
+  }
+});
 
 // ── DELETE BENEFICIARY ──────────────────────────────────
-app.delete(
-  "/api/user/beneficiaries/:id",
-  authenticate,
-  async (req, res) => {
-    try {
-      const { id } = req.params;
-      const { error } = await supabase
-        .from("beneficiaries")
-        .update({ is_active: false })
-        .eq("id", id)
-        .eq("user_id", req.user.id);
+app.delete("/api/user/beneficiaries/:id", authenticate, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { error } = await supabase
+      .from("beneficiaries")
+      .update({ is_active: false })
+      .eq("id", id)
+      .eq("user_id", req.user.id);
 
-      if (error) throw error;
-      res.json({ success: true });
-    } catch (error) {
-      console.error("[Delete Beneficiary] Error:", error);
-      res.status(500).json({ error: "Failed to delete beneficiary" });
-    }
-  },
-);
+    if (error) throw error;
+    res.json({ success: true });
+  } catch (error) {
+    console.error("[Delete Beneficiary] Error:", error);
+    res.status(500).json({ error: "Failed to delete beneficiary" });
+  }
+});
 
 // ── PIN/UNPIN BENEFICIARY ──────────────────────────────────────────
-app.patch(
-  "/api/user/beneficiaries/:id/pin",
-  authenticate,
-  async (req, res) => {
-    try {
-      const { id } = req.params;
-      const { is_pinned } = req.body;
+app.patch("/api/user/beneficiaries/:id/pin", authenticate, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { is_pinned } = req.body;
 
-      const { error } = await supabase
-        .from("beneficiaries")
-        .update({ is_pinned: !!is_pinned })
-        .eq("id", id)
-        .eq("user_id", req.user.id);
+    const { error } = await supabase
+      .from("beneficiaries")
+      .update({ is_pinned: !!is_pinned })
+      .eq("id", id)
+      .eq("user_id", req.user.id);
 
-      if (error) throw error;
-      res.json({ success: true });
-    } catch (error) {
-      console.error("[Pin Beneficiary] Error:", error);
-      res.status(500).json({ error: "Failed to update beneficiary" });
-    }
-  },
-);
+    if (error) throw error;
+    res.json({ success: true });
+  } catch (error) {
+    console.error("[Pin Beneficiary] Error:", error);
+    res.status(500).json({ error: "Failed to update beneficiary" });
+  }
+});
 
 app.get("/api/flutterwave/banks", authenticate, async (req, res) => {
   try {
@@ -15699,7 +15779,6 @@ app.post(
   externalTransferService.handleCreateTransfer,
 );
 
-
 app.get(
   "/api/flutterwave/transfer-status/:reference",
   authenticate,
@@ -15741,7 +15820,6 @@ app.get("/api/cron/external-transfers", externalTransferWorker.cronHandler);
 
 // ADD this — the reconciliation sweep that's been completely unwired until now:
 app.get("/api/cron/transfer-webhooks", transferWebhookHandler.cronHandler);
-
 
 app.get("/api/cron/cleanup-account-cache", accountResolutionCache.cronHandler);
 
@@ -16513,27 +16591,41 @@ app.post(
   authorizeAdmin,
   requirePermission("accounts:update-balance"),
   async (req, res) => {
-    const requestId = req.headers["idempotency-key"] || req.body.requestId || crypto.randomUUID();
+    const requestId =
+      req.headers["idempotency-key"] ||
+      req.body.requestId ||
+      crypto.randomUUID();
 
     try {
       const { userId } = req.params;
-      const { account_id, amount, action, make_it_look_like_transfer, from_user_id, description } = req.body;
+      const {
+        account_id,
+        amount,
+        action,
+        make_it_look_like_transfer,
+        from_user_id,
+        description,
+      } = req.body;
 
-      const { data, error } = await supabase.rpc("process_admin_balance_adjustment", {
-        p_request_id: requestId,
-        p_admin_id: req.user.id,
-        p_target_user_id: userId,
-        p_account_id: account_id,
-        p_amount: amount,
-        p_action: action,
-        p_description: description || null,
-        p_make_it_look_like_transfer: !!make_it_look_like_transfer,
-        p_from_user_id: from_user_id || null,
-      });
+      const { data, error } = await supabase.rpc(
+        "process_admin_balance_adjustment",
+        {
+          p_request_id: requestId,
+          p_admin_id: req.user.id,
+          p_target_user_id: userId,
+          p_account_id: account_id,
+          p_amount: amount,
+          p_action: action,
+          p_description: description || null,
+          p_make_it_look_like_transfer: !!make_it_look_like_transfer,
+          p_from_user_id: from_user_id || null,
+        },
+      );
 
       if (error) {
         const code = errCode(error);
-        if (code) return res.status(mapStatus(code)).json({ error: FRIENDLY[code] });
+        if (code)
+          return res.status(mapStatus(code)).json({ error: FRIENDLY[code] });
         console.error("Admin update balance error:", error);
         return res.status(500).json({ error: "Failed to update balance" });
       }
@@ -16550,7 +16642,13 @@ app.post(
         admin_id: req.user.id,
         action_type: "update_balance",
         target_user_id: userId,
-        details: { account_id, amount, action, make_it_look_like_transfer, from_user_id },
+        details: {
+          account_id,
+          amount,
+          action,
+          make_it_look_like_transfer,
+          from_user_id,
+        },
       });
 
       res.json({
@@ -17645,7 +17743,10 @@ app.post(
         action_type: "role_change",
         target_user_id: userId,
         details: {
-          from: { role: targetBefore.role, admin_role: targetBefore.admin_role },
+          from: {
+            role: targetBefore.role,
+            admin_role: targetBefore.admin_role,
+          },
           to: { role, admin_role: updates.admin_role },
           timestamp: new Date().toISOString(),
         },
@@ -17665,7 +17766,10 @@ app.post(
         created_at: new Date().toISOString(),
       });
 
-      if (user.admin_permissions && typeof user.admin_permissions === "string") {
+      if (
+        user.admin_permissions &&
+        typeof user.admin_permissions === "string"
+      ) {
         try {
           user.admin_permissions = JSON.parse(user.admin_permissions);
         } catch (e) {
