@@ -100,7 +100,7 @@ const pinVerifyLimiter = rateLimit({
   keyGenerator: (req) => `${req.ip}:${req.user?.id || "anon"}`,
 });
 
-const frozylaWebhookRouter = require("../lib/frozyla-webhook-routes"); 
+const frozylaWebhookRouter = require("../lib/frozyla-webhook-routes");
 app.use("/api/webhooks/frozyla", frozylaWebhookRouter);
 
 // SECURITY FIX (Critical): registration and staff-ID verification had no
@@ -366,6 +366,8 @@ app.get("/api/cron/deposit-webhooks", depositWebhookService.cronHandler);
 const statementService = require("../lib/statement-service");
 
 const savingsAdminRouter = require("./services/savings-admin-routes");
+
+const onboardingRoutes = require("../lib/onboarding-routes");
 
 const savingsCatalogRouter = require("./services/savings-catalog-routes");
 
@@ -15092,6 +15094,8 @@ app.use(
   savingsAdminRouter(requirePermission),
 );
 
+app.use("/api/onboarding", onboardingRoutes);
+
 app.use("/api/user/savings/catalog", authenticate, savingsCatalogRouter);
 
 app.use("/api/user/savings/generic", authenticate, savingsGenericRouter);
@@ -18911,6 +18915,3 @@ createDefaultAdmin();
 
 // Add this instead (required for Vercel)
 module.exports = app;
- 
-
-
