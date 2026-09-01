@@ -398,6 +398,15 @@ const { sendToToken, sendToTokens } = require("../lib/fcm-service");
 
 const vatAdminRouter = require("../lib/vat-admin-routes");
 
+// ==================== SMS INFRASTRUCTURE (multi-provider: Termii /
+// Africa's Talking / BulkSMSNigeria / Arkesel, with automatic failover) ====================
+// Replaces the direct africastalking client below — see sendOTPSMS().
+const smsService = require("../lib/sms/sms-service");
+const otpRoutes = require("../lib/sms/otp-routes");
+const smsWebhookRoutes = require("../lib/sms/sms-webhook-routes");
+const smsAdminRoutes = require("../lib/sms/sms-admin-routes");
+const smsWorker = require("../lib/sms/sms-worker");
+
 // Configure VAPID for web push - ADD THIS SECTION
 webpush.setVapidDetails(
   process.env.VAPID_SUBJECT || "mailto:support@paystora.com",
@@ -955,86 +964,52 @@ async function createNotification(userId, title, message, type = "info") {
   }
 }
 
-// ==================== SMS CONFIGURATION (AFRICA'S TALKING) ====================
-// Single initialization, guarded by env vars actually being present.
-// The previous version called require("africastalking")(...) unconditionally
-// on this line AND tried to call the result as a function again a few lines
-// below — that second call was invoking an already-initialized client
-// object, not the factory, which is exactly "africastalking is not a
-// function". One factory call, one guard, one variable used everywhere.
-let africasTalkingClient = null;
-try {
-  if (
-    process.env.AFRICASTALKING_API_KEY &&
-    process.env.AFRICASTALKING_USERNAME
-  ) {
-    africasTalkingClient = require("africastalking")({
-      apiKey: process.env.AFRICASTALKING_API_KEY,
-      username: process.env.AFRICASTALKING_USERNAME,
-    });
-    console.log("✅ Africa's Talking initialized for SMS");
-  } else {
-    console.log("⚠️ Africa's Talking credentials missing - SMS disabled");
-  }
-} catch (error) {
-  console.error("❌ Africa's Talking initialization error:", error.message);
-}
-
-// Send SMS using Africa's Talking
-async function sendOTPSMS(phoneNumber, otp) {
-  // Skip if client not initialized
-  if (!africasTalkingClient) {
-    console.log(
-      `⚠️ SMS not sent - Africa's Talking not configured. Would send OTP ${otp} to ${phoneNumber}`,
-    );
+// ==================== SMS CONFIGURATION (multi-provider) ====================
+// Previously: a single Africa's Talking client, called directly from
+// this file — one provider, no failover, and an outage there meant an
+// OTP just didn't go out (or fell back straight to email with no
+// retry). Now routed through lib/sms/sms-service.js, which tries
+// Termii -> Africa's Talking -> BulkSMSNigeria -> Arkesel in priority
+// order (admin-configurable) before giving up, with a circuit breaker
+// per provider and a full delivery audit trail. AFRICASTALKING_API_KEY/
+// USERNAME/SENDER_ID are read by lib/sms/providers/africastalking-adapter.js
+// now, not here — same env var names, nothing to change in your env config.
+//
+// IMPORTANT BEHAVIOR CHANGE: sendOTPSMS() used to `await` a direct,
+// synchronous call to Africa's Talking and only returned `true` once
+// that single provider had actually accepted the message. It now
+// queues the send and fires it immediately in the background (see
+// sms-service.js's use of `waitUntil` — same pattern already used
+// elsewhere in this codebase for virtual-account creation), so it
+// typically completes in well under a second, but `true` now means
+// "dispatched for delivery across up to 4 providers with automatic
+// failover," not "provider N confirmed receipt." If a call site here
+// needs a hard delivery guarantee before responding to the user, poll
+// `smsService.getStatus(smsMessageId)` (returned from the same call)
+// rather than trusting the boolean alone.
+async function sendOTPSMS(phoneNumber, otp, userId = null) {
+  if (!phoneNumber || !phoneNumber.trim()) {
+    console.log("⚠️ SMS not sent - no phone number provided");
     return false;
   }
 
-  // Format phone number (ensure it has country code)
-  let formattedNumber = phoneNumber.trim();
-  if (!formattedNumber.startsWith("+")) {
-    // Add Nigeria country code if not present
-    if (formattedNumber.startsWith("0")) {
-      formattedNumber = "+234" + formattedNumber.substring(1);
-    } else if (!formattedNumber.startsWith("234")) {
-      formattedNumber = "+234" + formattedNumber;
-    }
-  }
-
-  console.log(
-    `📱 Attempting to send SMS to ${formattedNumber} with OTP ${otp}`,
-  );
+  console.log(`📱 Dispatching OTP SMS to ${maskPhoneNumber(phoneNumber)}`);
 
   try {
-    const result = await africasTalkingClient.SMS.send({
-      to: formattedNumber,
+    const result = await smsService.sendSMS({
+      userId,
+      phone: phoneNumber,
       message: `Your FEECENT verification code is: ${otp}. Valid for 10 minutes. DO NOT share this code with anyone.`,
-      from: process.env.AFRICASTALKING_SENDER_ID || "FEECENT",
+      templateId: "LEGACY_PASSCODE_OTP",
+      messageType: "otp",
     });
-
-    console.log("✅ SMS sent successfully:", result);
-
-    // Check if SMS was actually sent (Africa's Talking returns array of results)
-    if (result && result.SMSMessageData && result.SMSMessageData.Recipients) {
-      const recipient = result.SMSMessageData.Recipients[0];
-      if (recipient.status === "Success") {
-        console.log(`✅ SMS delivered to ${recipient.number}`);
-        return true;
-      } else {
-        console.error(
-          `❌ SMS failed: ${recipient.status} - ${recipient.statusCode}`,
-        );
-        return false;
-      }
-    }
-
+    console.log(`✅ SMS queued (sms_message_id=${result.smsMessageId})`);
     return true;
   } catch (error) {
-    console.error("❌ SMS error details:", {
-      message: error.message,
-      code: error.code,
-      response: error.response?.data || error.response,
-    });
+    // Mirrors the old function's contract: false + logged reason,
+    // never throws, so existing call sites' try/catch-and-fall-back-to-
+    // email logic keeps working unchanged.
+    console.error("❌ SMS dispatch error:", error.message);
     return false;
   }
 }
@@ -1046,7 +1021,7 @@ async function sendOTPWithFallback(user, otp) {
 
   // Try SMS first if user has phone
   if (user.phone && user.phone.trim()) {
-    smsSent = await sendOTPSMS(user.phone, otp);
+    smsSent = await sendOTPSMS(user.phone, otp, user.id);
   }
 
   // Always send email as backup (or primary if SMS failed)
@@ -1294,6 +1269,20 @@ app.use(
   authorizeAdmin,
   vatAdminRouter(requirePermission),
 );
+
+// SMS infrastructure — user-facing OTP API, delivery webhooks
+// (provider-called, not behind authenticate — same pattern used for
+// the Flutterwave webhook), admin panel, and the cron safety net for
+// anything that doesn't finish inline via waitUntil (see sms-service.js).
+app.use("/api/otp", authenticate, otpRoutes);
+app.use("/api/webhooks/sms", smsWebhookRoutes);
+app.use(
+  "/api/sys/sms",
+  authenticate,
+  authorizeAdmin,
+  smsAdminRoutes(requirePermission),
+);
+app.get("/api/cron/sms-worker", smsWorker.cronHandler);
 
 // ==================== SECURITY MONITORING ENDPOINTS ====================
 // Log security events
@@ -4623,7 +4612,7 @@ app.post("/api/user/send-passcode-otp", authenticate, async (req, res) => {
 
     if (method === "sms" && user.phone && user.phone.trim()) {
       try {
-        await sendOTPSMS(user.phone, otpCode);
+        await sendOTPSMS(user.phone, otpCode, req.user.id);
         sent = true;
         sentMethod = "sms";
         contact = maskPhoneNumber(user.phone);
@@ -4645,7 +4634,7 @@ app.post("/api/user/send-passcode-otp", authenticate, async (req, res) => {
         // If email fails, try SMS as fallback
         if (user.phone && user.phone.trim()) {
           try {
-            await sendOTPSMS(user.phone, otpCode);
+            await sendOTPSMS(user.phone, otpCode, req.user.id);
             sentMethod = "sms";
             contact = maskPhoneNumber(user.phone);
             console.log(`OTP sent via SMS fallback to ${user.phone}`);
@@ -4723,7 +4712,7 @@ app.post("/api/user/resend-passcode-otp", authenticate, async (req, res) => {
 
     if (method === "sms" && user.phone && user.phone.trim()) {
       try {
-        await sendOTPSMS(user.phone, otpCode);
+        await sendOTPSMS(user.phone, otpCode, req.user.id);
         sent = true;
         sentMethod = "sms";
         contact = maskPhoneNumber(user.phone);
