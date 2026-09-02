@@ -401,11 +401,11 @@ const vatAdminRouter = require("../lib/vat-admin-routes");
 // ==================== SMS INFRASTRUCTURE (multi-provider: Termii /
 // Africa's Talking / BulkSMSNigeria / Arkesel, with automatic failover) ====================
 // Replaces the direct africastalking client below — see sendOTPSMS().
-const smsService = require("../lib/sms/sms-service");
-const otpRoutes = require("../lib/sms/otp-routes");
-const smsWebhookRoutes = require("../lib/sms/sms-webhook-routes");
-const smsAdminRoutes = require("../lib/sms/sms-admin-routes");
-const smsWorker = require("../lib/sms/sms-worker");
+const smsService = require("../lib/sms-service");
+const otpRoutes = require("../lib/otp-routes");
+const smsWebhookRoutes = require("../lib/sms-webhook-routes");
+const smsAdminRoutes = require("../lib/sms-admin-routes");
+const smsWorker = require("../lib/sms-worker");
 
 // Configure VAPID for web push - ADD THIS SECTION
 webpush.setVapidDetails(
